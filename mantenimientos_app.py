@@ -413,8 +413,8 @@ with tab_pai:
     COL_RANGE_PAI = "B:Q"
 
     PAI_CYCLES = {
-        1: {"label": "01 - PAI Enero-Diciembre (mismo año)", "prefix": "PRIMER PAI"},
-        2: {"label": "02 - PAI Julio-Junio (cruza al año siguiente)", "prefix": "SEGUNDO PAI"},
+        1: {"label": "01 - PAI Enero-Diciembre (mismo año)", "prefix": "PAI", "prefix_alt": ["PRIMER PAI"]},
+        2: {"label": "02 - PAI Julio-Junio (cruza al año siguiente)", "prefix": "SEGUNDO PAI", "prefix_alt": []},
     }
 
     def build_ciclo_folder_variants(year: int, cycle: int):
@@ -432,8 +432,16 @@ with tab_pai:
     def generate_url_candidates_pai(year, cycle, final_override="", prefix_override=""):
         ciclo_folder_variants = build_ciclo_folder_variants(year, cycle)
         default_prefix = PAI_CYCLES[cycle]["prefix"]
+        alt_prefixes = PAI_CYCLES[cycle].get("prefix_alt", [])
 
-        prefixes = [prefix_override] if prefix_override else [default_prefix, default_prefix.replace(" ", "_")]
+        if prefix_override:
+            prefixes = [prefix_override]
+        else:
+            all_prefixes = [default_prefix] + alt_prefixes
+            prefixes = []
+            for p in all_prefixes:
+                prefixes.append(p)
+                prefixes.append(p.replace(" ", "_"))
 
         base_finals = [final_override] if final_override else ["03_Final", "02_Final", "Final", "01_Final"]
         # COES a veces también le pone un espacio inicial a la subcarpeta final (confirmado en 2025),
@@ -485,7 +493,7 @@ with tab_pai:
             "Forzar subcarpeta final (dejar vacío = probar automáticamente)", value="", key="final_override_pai"
         )
         prefix_override = st.text_input(
-            "Forzar prefijo del ZIP (dejar vacío = usar 'PRIMER PAI' / 'SEGUNDO PAI')",
+            "Forzar prefijo del ZIP (dejar vacío = usar 'PAI' / 'SEGUNDO PAI')",
             value="", key="prefix_override_pai",
         )
 
