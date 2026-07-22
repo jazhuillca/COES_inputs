@@ -91,13 +91,21 @@ with tab_mensual:
             try:
                 resp = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
                 status = resp.status_code
-                if status in (405, 501):
+                content_type = resp.headers.get("Content-Type", "")
+                if status in (405, 501) or (status == 200 and not content_type):
+                    # servidor no soporta HEAD bien -> confirmar con GET en streaming
                     resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
                     status = resp.status_code
+                    content_type = resp.headers.get("Content-Type", "")
                     resp.close()
             except Exception as e:
                 tried.append((url, f"ERROR: {e}"))
                 continue
+
+            if status == 200 and "html" in content_type.lower():
+                tried.append((url, f"200 pero content-type={content_type} (no es un ZIP real)"))
+                continue
+
             tried.append((url, status))
             if status == 200:
                 return url, tried
@@ -117,6 +125,13 @@ with tab_mensual:
         response = requests.get(url, headers=headers, timeout=60)
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code} al descargar {mes_display} {year} (url: {url})")
+        if not response.content[:2] == b"PK":
+            snippet = response.text[:200].replace("\n", " ") if response.text else ""
+            raise RuntimeError(
+                f"La respuesta para {mes_display} {year} no es un ZIP real "
+                f"(content-type: {response.headers.get('Content-Type', '?')}). "
+                f"Posible página de error del portal. Inicio del contenido: {snippet!r} (url: {url})"
+            )
 
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             namelist = z.namelist()
@@ -238,13 +253,44 @@ with tab_pai:
         2: {"label": "02 - PAI Julio-Junio (cruza al año siguiente)", "prefix": "SEGUNDO PAI"},
     }
 
-    def build_ciclo_folder(year: int, cycle: int) -> str:
+    def build_ciclo_folder_variants(year: int, cycle: int):
+        """Devuelve variantes del nombre de carpeta del ciclo, porque COES a veces
+        le agrega un espacio inicial raro al nombre (confirmado en el ciclo 1 de 2026)."""
         yy = str(year)[2:]
         if cycle == 1:
-            return f"01_PAI Ene{yy}-Dic{yy}"
+            base = f"01_PAI Ene{yy}-Dic{yy}"
+            return [f" {base}", base]  # variante con espacio inicial primero (caso confirmado)
         else:
             yy2 = str(year + 1)[2:]
-            return f"02_PAI Jul{yy}-Jun{yy2}"
+            base = f"02_PAI Jul{yy}-Jun{yy2}"
+            return [base, f" {base}"]
+
+    def generate_url_candidates_pai(year, cycle, final_override="", prefix_override=""):
+        ciclo_folder_variants = build_ciclo_folder_variants(year, cycle)
+        default_prefix = PAI_CYCLES[cycle]["prefix"]
+
+        prefixes = [prefix_override] if prefix_override else [default_prefix, default_prefix.replace(" ", "_")]
+        final_folders = [final_override] if final_override else ["03_Final", "02_Final", "Final", "01_Final"]
+        separators = ["_", " "]  # antes del año: "PRIMER PAI_2026.zip" vs "PRIMER PAI 2026.zip"
+
+        candidates = []
+        for ciclo_folder in ciclo_folder_variants:
+            for ff in final_folders:
+                for pfx in prefixes:
+                    for sep in separators:
+                        archivo_zip = f"{pfx}{sep}{year}.zip"
+                        url = (
+                            f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Anual%2F{year}%2F"
+                            f"{quote(ciclo_folder)}%2F{quote(ff)}%2F{quote(archivo_zip)}"
+                        )
+                        candidates.append(url)
+
+        seen, unique = set(), []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        return unique
 
     col1, col2 = st.columns(2)
     with col1:
@@ -273,30 +319,6 @@ with tab_pai:
     periodos_p = [(y, c) for y in sorted(years_p) for c in sorted(cycles_p)]
     st.caption(f"Se descargarán {len(periodos_p)} combinación(es) de año/ciclo.")
 
-    def generate_url_candidates_pai(year, cycle, final_override="", prefix_override=""):
-        ciclo_folder = build_ciclo_folder(year, cycle)
-        default_prefix = PAI_CYCLES[cycle]["prefix"]
-
-        prefixes = [prefix_override] if prefix_override else [default_prefix, default_prefix.replace(" ", "_")]
-        final_folders = [final_override] if final_override else ["02_Final", "03_Final", "Final", "01_Final"]
-
-        candidates = []
-        for ff in final_folders:
-            for pfx in prefixes:
-                archivo_zip = f"{pfx}_{year}.zip"
-                url = (
-                    f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Anual%2F{year}%2F"
-                    f"{quote(ciclo_folder)}%2F{quote(ff)}%2F{quote(archivo_zip)}"
-                )
-                candidates.append(url)
-
-        seen, unique = set(), []
-        for c in candidates:
-            if c not in seen:
-                seen.add(c)
-                unique.append(c)
-        return unique
-
     def find_working_url_pai(candidates, headers, timeout=20):
         tried = []
         for url in candidates:
@@ -304,13 +326,20 @@ with tab_pai:
             try:
                 resp = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
                 status = resp.status_code
-                if status in (405, 501):
+                content_type = resp.headers.get("Content-Type", "")
+                if status in (405, 501) or (status == 200 and not content_type):
                     resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
                     status = resp.status_code
+                    content_type = resp.headers.get("Content-Type", "")
                     resp.close()
             except Exception as e:
                 tried.append((url, f"ERROR: {e}"))
                 continue
+
+            if status == 200 and "html" in content_type.lower():
+                tried.append((url, f"200 pero content-type={content_type} (no es un ZIP real)"))
+                continue
+
             tried.append((url, status))
             if status == 200:
                 return url, tried
@@ -331,6 +360,13 @@ with tab_pai:
         response = requests.get(url, headers=headers, timeout=60)
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code} al descargar PAI {cycle_label} {year} (url: {url})")
+        if not response.content[:2] == b"PK":
+            snippet = response.text[:200].replace("\n", " ") if response.text else ""
+            raise RuntimeError(
+                f"La respuesta para {cycle_label} {year} no es un ZIP real "
+                f"(content-type: {response.headers.get('Content-Type', '?')}). "
+                f"Posible página de error del portal. Inicio del contenido: {snippet!r} (url: {url})"
+            )
 
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             namelist = z.namelist()
