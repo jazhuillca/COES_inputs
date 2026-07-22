@@ -434,7 +434,16 @@ with tab_pai:
         default_prefix = PAI_CYCLES[cycle]["prefix"]
 
         prefixes = [prefix_override] if prefix_override else [default_prefix, default_prefix.replace(" ", "_")]
-        final_folders = [final_override] if final_override else ["03_Final", "02_Final", "Final", "01_Final"]
+
+        base_finals = [final_override] if final_override else ["03_Final", "02_Final", "Final", "01_Final"]
+        # COES a veces también le pone un espacio inicial a la subcarpeta final (confirmado en 2025),
+        # y a veces no (confirmado en 2024 y 2026) — probamos ambas variantes.
+        final_folders = []
+        for ff in base_finals:
+            final_folders.append(ff)
+            if not ff.startswith(" "):
+                final_folders.append(f" {ff}")
+
         separators = ["_", " "]  # antes del año: "PRIMER PAI_2026.zip" vs "PRIMER PAI 2026.zip"
 
         candidates = []
