@@ -33,6 +33,48 @@ def col_letter_to_index(letter: str) -> int:
     return result - 1
 
 
+def fetch_valid_zip(candidates, headers, timeout=30):
+    """
+    Prueba cada URL candidata con un GET en streaming (COES no soporta bien HEAD
+    en este endpoint de descarga, así que no lo usamos) y devuelve la primera que
+    sea un ZIP real: status 200, content-type que no sea HTML, y bytes iniciales 'PK'.
+    Devuelve (url, contenido_bytes, lista_de_intentos) o (None, None, lista_de_intentos).
+    """
+    tried = []
+    for url in candidates:
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        except Exception as e:
+            tried.append((url, f"ERROR: {e}"))
+            continue
+
+        status = resp.status_code
+        content_type = resp.headers.get("Content-Type", "")
+
+        if status != 200:
+            tried.append((url, status))
+            resp.close()
+            continue
+
+        if "html" in content_type.lower():
+            tried.append((url, f"200 pero content-type={content_type} (no es un ZIP real)"))
+            resp.close()
+            continue
+
+        content = resp.content  # descarga completa solo del candidato que llegó hasta aquí
+        resp.close()
+
+        if content[:2] != b"PK":
+            snippet = content[:200].decode("latin-1", errors="ignore").replace("\n", " ")
+            tried.append((url, f"200 pero no son bytes de ZIP (inicio: {snippet!r})"))
+            continue
+
+        tried.append((url, status))
+        return url, content, tried
+
+    return None, None, tried
+
+
 tab_mensual, tab_pai = st.tabs(["📅 Programa Mensual (Intervenciones)", "📆 Programa Anual (PAI)"])
 
 # ======================================================================
@@ -84,56 +126,19 @@ with tab_mensual:
                 unique.append(c)
         return unique
 
-    def find_working_url(candidates, headers, timeout=20):
-        tried = []
-        for url in candidates:
-            status = None
-            try:
-                resp = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
-                status = resp.status_code
-                content_type = resp.headers.get("Content-Type", "")
-                if status in (405, 501) or (status == 200 and not content_type):
-                    # servidor no soporta HEAD bien -> confirmar con GET en streaming
-                    resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
-                    status = resp.status_code
-                    content_type = resp.headers.get("Content-Type", "")
-                    resp.close()
-            except Exception as e:
-                tried.append((url, f"ERROR: {e}"))
-                continue
-
-            if status == 200 and "html" in content_type.lower():
-                tried.append((url, f"200 pero content-type={content_type} (no es un ZIP real)"))
-                continue
-
-            tried.append((url, status))
-            if status == 200:
-                return url, tried
-        return None, tried
-
     def download_and_extract_mensual(year, month):
         mes_display = MESES[month]
         headers = {"User-Agent": "Mozilla/5.0"}
         candidates = generate_url_candidates_mensual(year, month)
-        url, tried = find_working_url(candidates, headers)
+        url, content, tried = fetch_valid_zip(candidates, headers)
         if url is None:
             detail = "\n".join(f"  [{status}] {u}" for u, status in tried)
             raise RuntimeError(
                 f"No se encontró un ZIP válido para {mes_display} {year} tras probar "
                 f"{len(tried)} variante(s):\n{detail}"
             )
-        response = requests.get(url, headers=headers, timeout=60)
-        if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code} al descargar {mes_display} {year} (url: {url})")
-        if not response.content[:2] == b"PK":
-            snippet = response.text[:200].replace("\n", " ") if response.text else ""
-            raise RuntimeError(
-                f"La respuesta para {mes_display} {year} no es un ZIP real "
-                f"(content-type: {response.headers.get('Content-Type', '?')}). "
-                f"Posible página de error del portal. Inicio del contenido: {snippet!r} (url: {url})"
-            )
 
-        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
             namelist = z.namelist()
             excel_files = [
                 f for f in namelist
@@ -319,37 +324,11 @@ with tab_pai:
     periodos_p = [(y, c) for y in sorted(years_p) for c in sorted(cycles_p)]
     st.caption(f"Se descargarán {len(periodos_p)} combinación(es) de año/ciclo.")
 
-    def find_working_url_pai(candidates, headers, timeout=20):
-        tried = []
-        for url in candidates:
-            status = None
-            try:
-                resp = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
-                status = resp.status_code
-                content_type = resp.headers.get("Content-Type", "")
-                if status in (405, 501) or (status == 200 and not content_type):
-                    resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
-                    status = resp.status_code
-                    content_type = resp.headers.get("Content-Type", "")
-                    resp.close()
-            except Exception as e:
-                tried.append((url, f"ERROR: {e}"))
-                continue
-
-            if status == 200 and "html" in content_type.lower():
-                tried.append((url, f"200 pero content-type={content_type} (no es un ZIP real)"))
-                continue
-
-            tried.append((url, status))
-            if status == 200:
-                return url, tried
-        return None, tried
-
     def download_and_extract_pai(year, cycle, final_override, prefix_override):
         cycle_label = PAI_CYCLES[cycle]["label"]
         headers = {"User-Agent": "Mozilla/5.0"}
         candidates = generate_url_candidates_pai(year, cycle, final_override, prefix_override)
-        url, tried = find_working_url_pai(candidates, headers)
+        url, content, tried = fetch_valid_zip(candidates, headers)
         if url is None:
             detail = "\n".join(f"  [{status}] {u}" for u, status in tried)
             raise RuntimeError(
@@ -357,18 +336,7 @@ with tab_pai:
                 f"{len(tried)} variante(s):\n{detail}"
             )
 
-        response = requests.get(url, headers=headers, timeout=60)
-        if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code} al descargar PAI {cycle_label} {year} (url: {url})")
-        if not response.content[:2] == b"PK":
-            snippet = response.text[:200].replace("\n", " ") if response.text else ""
-            raise RuntimeError(
-                f"La respuesta para {cycle_label} {year} no es un ZIP real "
-                f"(content-type: {response.headers.get('Content-Type', '?')}). "
-                f"Posible página de error del portal. Inicio del contenido: {snippet!r} (url: {url})"
-            )
-
-        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
             namelist = z.namelist()
             excel_files = [
                 f for f in namelist
