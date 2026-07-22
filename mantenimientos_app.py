@@ -230,7 +230,7 @@ with tab_pai:
 
     SHEET_PAI = "MANTTOS"
     HEADER_PAI = 9
-    COL_RANGE_PAI = "B:P"
+    COL_RANGE_PAI = "B:Q"
 
     col1, col2 = st.columns(2)
     with col1:
@@ -278,7 +278,6 @@ with tab_pai:
                     usecols=COL_RANGE_PAI,
                 )
                 df = df.dropna(how="all").reset_index(drop=True)
-                df["AÑO"] = year
         return df, url
 
     if st.button("🚀 Descargar y consolidar (PAI)", type="primary", key="btn_pai"):
