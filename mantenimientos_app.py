@@ -224,39 +224,113 @@ with tab_pai:
     """
     )
     st.caption(
-        "El nombre del ciclo y el prefijo del ZIP cambian cada año/ciclo del PAI "
-        "(ej. '02_PAI Jul26-Jun27', 'SEGUNDO PAI') — ajústalos aquí si COES los cambia."
+        "Cada año COES publica dos ciclos de PAI: uno **Enero-Diciembre** (mismo año) "
+        "y otro **Julio-Junio** (cruza al año siguiente). El nombre de la carpeta se "
+        "arma automáticamente a partir del año que elijas."
     )
 
     SHEET_PAI = "MANTTOS"
     HEADER_PAI = 9
     COL_RANGE_PAI = "B:Q"
 
+    PAI_CYCLES = {
+        1: {"label": "01 - PAI Enero-Diciembre (mismo año)", "prefix": "PRIMER PAI"},
+        2: {"label": "02 - PAI Julio-Junio (cruza al año siguiente)", "prefix": "SEGUNDO PAI"},
+    }
+
+    def build_ciclo_folder(year: int, cycle: int) -> str:
+        yy = str(year)[2:]
+        if cycle == 1:
+            return f"01_PAI Ene{yy}-Dic{yy}"
+        else:
+            yy2 = str(year + 1)[2:]
+            return f"02_PAI Jul{yy}-Jun{yy2}"
+
     col1, col2 = st.columns(2)
     with col1:
-        ciclo_folder = st.text_input("Carpeta del ciclo PAI", value="02_PAI Jul26-Jun27", key="ciclo_pai")
-        final_folder = st.text_input("Subcarpeta final", value="03_Final", key="final_pai")
+        years_p = st.multiselect("Año(s)", options=list(range(2022, 2031)), default=[2026], key="years_pai")
     with col2:
-        zip_prefix = st.text_input("Prefijo del ZIP", value="SEGUNDO PAI", key="prefijo_pai")
-        max_workers_p = st.slider("Descargas en paralelo", 1, 6, 3, key="workers_pai")
-
-    years_p = st.multiselect("Año(s)", options=list(range(2022, 2031)), default=[2026], key="years_pai")
-    st.caption(f"Se descargará(n) {len(years_p)} año(s).")
-
-    def generate_url_pai(year, ciclo_folder, final_folder, zip_prefix):
-        archivo_zip = f"{zip_prefix}_{year}.zip"
-        url = (
-            f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Anual%2F{year}%2F"
-            f"{quote(ciclo_folder)}%2F{quote(final_folder)}%2F{quote(archivo_zip)}"
+        cycles_p = st.multiselect(
+            "Ciclo(s) PAI",
+            options=list(PAI_CYCLES.keys()),
+            default=[1, 2],
+            format_func=lambda c: PAI_CYCLES[c]["label"],
+            key="cycles_pai",
         )
-        return url
 
-    def download_and_extract_pai(year, ciclo_folder, final_folder, zip_prefix):
-        url = generate_url_pai(year, ciclo_folder, final_folder, zip_prefix)
+    with st.expander("⚙️ Opciones avanzadas", expanded=False):
+        max_workers_p = st.slider("Descargas en paralelo", 1, 6, 3, key="workers_pai")
+        show_debug_p = st.checkbox("Mostrar variantes de URL probadas (debug)", key="debug_pai")
+        st.caption("Si la detección automática falla, puedes forzar la subcarpeta final y/o el prefijo del ZIP:")
+        final_folder_override = st.text_input(
+            "Forzar subcarpeta final (dejar vacío = probar automáticamente)", value="", key="final_override_pai"
+        )
+        prefix_override = st.text_input(
+            "Forzar prefijo del ZIP (dejar vacío = usar 'PRIMER PAI' / 'SEGUNDO PAI')",
+            value="", key="prefix_override_pai",
+        )
+
+    periodos_p = [(y, c) for y in sorted(years_p) for c in sorted(cycles_p)]
+    st.caption(f"Se descargarán {len(periodos_p)} combinación(es) de año/ciclo.")
+
+    def generate_url_candidates_pai(year, cycle, final_override="", prefix_override=""):
+        ciclo_folder = build_ciclo_folder(year, cycle)
+        default_prefix = PAI_CYCLES[cycle]["prefix"]
+
+        prefixes = [prefix_override] if prefix_override else [default_prefix, default_prefix.replace(" ", "_")]
+        final_folders = [final_override] if final_override else ["02_Final", "03_Final", "Final", "01_Final"]
+
+        candidates = []
+        for ff in final_folders:
+            for pfx in prefixes:
+                archivo_zip = f"{pfx}_{year}.zip"
+                url = (
+                    f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Anual%2F{year}%2F"
+                    f"{quote(ciclo_folder)}%2F{quote(ff)}%2F{quote(archivo_zip)}"
+                )
+                candidates.append(url)
+
+        seen, unique = set(), []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        return unique
+
+    def find_working_url_pai(candidates, headers, timeout=20):
+        tried = []
+        for url in candidates:
+            status = None
+            try:
+                resp = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+                status = resp.status_code
+                if status in (405, 501):
+                    resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+                    status = resp.status_code
+                    resp.close()
+            except Exception as e:
+                tried.append((url, f"ERROR: {e}"))
+                continue
+            tried.append((url, status))
+            if status == 200:
+                return url, tried
+        return None, tried
+
+    def download_and_extract_pai(year, cycle, final_override, prefix_override):
+        cycle_label = PAI_CYCLES[cycle]["label"]
         headers = {"User-Agent": "Mozilla/5.0"}
+        candidates = generate_url_candidates_pai(year, cycle, final_override, prefix_override)
+        url, tried = find_working_url_pai(candidates, headers)
+        if url is None:
+            detail = "\n".join(f"  [{status}] {u}" for u, status in tried)
+            raise RuntimeError(
+                f"No se encontró un ZIP válido para {cycle_label} {year} tras probar "
+                f"{len(tried)} variante(s):\n{detail}"
+            )
+
         response = requests.get(url, headers=headers, timeout=60)
         if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code} al descargar PAI {year} (url: {url})")
+            raise RuntimeError(f"HTTP {response.status_code} al descargar PAI {cycle_label} {year} (url: {url})")
 
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             namelist = z.namelist()
@@ -266,7 +340,7 @@ with tab_pai:
             ]
             if not excel_files:
                 raise FileNotFoundError(
-                    f"No se encontró LISTADO_Mantto en el ZIP del PAI {year} (url: {url}). "
+                    f"No se encontró LISTADO_Mantto en el ZIP de {cycle_label} {year} (url: {url}). "
                     f"Archivos disponibles: {namelist}"
                 )
             excel_name = excel_files[0]
@@ -278,47 +352,58 @@ with tab_pai:
                     usecols=COL_RANGE_PAI,
                 )
                 df = df.dropna(how="all").reset_index(drop=True)
-        return df, url
+        return df, url, tried
 
     if st.button("🚀 Descargar y consolidar (PAI)", type="primary", key="btn_pai"):
-        if not years_p:
-            st.error("Selecciona al menos un año.")
+        if not periodos_p:
+            st.error("Selecciona al menos un año y un ciclo.")
         else:
-            results, errors = [], []
+            results, errors, debug_info = [], [], []
             progress = st.progress(0.0)
             status = st.empty()
             t0 = time.time()
 
             with ThreadPoolExecutor(max_workers=max_workers_p) as executor:
                 futures = {
-                    executor.submit(download_and_extract_pai, y, ciclo_folder, final_folder, zip_prefix): y
-                    for y in years_p
+                    executor.submit(
+                        download_and_extract_pai, y, c, final_folder_override, prefix_override
+                    ): (y, c)
+                    for y, c in periodos_p
                 }
                 done = 0
                 for future in as_completed(futures):
-                    y = futures[future]
+                    y, c = futures[future]
+                    label = f"{PAI_CYCLES[c]['label']} — {y}"
                     try:
-                        df, used_url = future.result()
+                        df, used_url, tried = future.result()
                         results.append(df)
+                        debug_info.append({"periodo": label, "used_url": used_url, "tried": tried})
                     except Exception as e:
-                        errors.append(f"Año {y}: {e}")
+                        errors.append(f"{label}: {e}")
                     done += 1
                     progress.progress(done / len(futures))
-                    status.text(f"Procesados {done}/{len(futures)} — último: {y}")
+                    status.text(f"Procesados {done}/{len(futures)} — último: {label}")
 
             elapsed = time.time() - t0
             status.empty()
             progress.empty()
-            st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(years_p)} año(s), {max_workers_p} en paralelo)")
+            st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(periodos_p)} combinación(es), {max_workers_p} en paralelo)")
 
             if errors:
                 with st.expander("⚠️ Errores", expanded=True):
                     for e in errors:
                         st.text(e)
 
+            if show_debug_p and debug_info:
+                with st.expander("🔎 Variantes de URL probadas", expanded=False):
+                    for info in debug_info:
+                        st.markdown(f"**{info['periodo']}** — usada: `{info['used_url']}`")
+                        for u, s in info["tried"]:
+                            st.text(f"  [{s}] {u}")
+
             if results:
                 df_final_p = pd.concat(results, ignore_index=True)
-                st.success(f"✅ {len(df_final_p):,} filas consolidadas de {len(results)} año(s).")
+                st.success(f"✅ {len(df_final_p):,} filas consolidadas de {len(results)} combinación(es).")
                 st.dataframe(df_final_p.head(300), use_container_width=True)
 
                 buf_xlsx = io.BytesIO()
@@ -335,4 +420,4 @@ with tab_pai:
                     file_name="PAI.csv", mime="text/csv", key="dl_csv_pai",
                 )
             else:
-                st.error("❌ No se consolidó ningún año.")
+                st.error("❌ No se consolidó ninguna combinación de año/ciclo.")
