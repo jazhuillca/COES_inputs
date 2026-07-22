@@ -240,8 +240,8 @@ with tab_mensual:
 with tab_preliminar:
     st.markdown(
         """
-    Descarga el archivo **Anexo1_Intervenciones_(Agentes)** del Programa Mensual, tanto en su
-    versión **Final** como **Preliminar** (útil cuando el mes en curso aún no tiene versión Final).
+    Descarga el archivo **Anexo1_Intervenciones_(Agentes)** en su versión **Preliminar**
+    del Programa Mensual (útil cuando el mes en curso aún no tiene versión Final).
     """
     )
 
@@ -253,7 +253,7 @@ with tab_preliminar:
         max_workers_pre = st.slider("Descargas en paralelo", 1, 6, 3, key="workers_preliminar")
         show_debug_pre = st.checkbox("Mostrar variantes de URL probadas (debug)", key="debug_preliminar")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         years_pre = st.multiselect("Año(s)", options=list(range(2022, 2031)), default=[2026], key="years_preliminar")
     with col2:
@@ -261,34 +261,26 @@ with tab_preliminar:
             "Mes(es)", options=list(MESES.keys()), default=[8],
             format_func=lambda m: MESES[m], key="months_preliminar",
         )
-    with col3:
-        stage_pre = st.selectbox("Versión", options=["Preliminar", "Final"], index=0, key="stage_preliminar")
 
     periodos_pre = [(y, m) for y in sorted(years_pre) for m in sorted(months_pre)]
-    st.caption(f"Se descargarán {len(periodos_pre)} periodo(s) — versión {stage_pre}.")
+    st.caption(f"Se descargarán {len(periodos_pre)} periodo(s).")
 
-    def generate_url_candidates_preliminar(year, month, stage):
+    def generate_url_candidates_preliminar(year, month):
         variantes_mes = [MESES[month]] + MESES_ALT.get(month, [])
         candidates = []
         for mes_nombre in variantes_mes:
             carpeta_mes = f"{month:02d}_{mes_nombre}"
             for case_variant in {mes_nombre, mes_nombre.title(), mes_nombre.capitalize()}:
-                if stage.upper() == "FINAL":
-                    carpeta_stage_opts = ["Final"]
-                    archivo_zip_opts = [f"PMENSUAL_{case_variant}_{year}.zip"]
-                else:
-                    carpeta_stage_opts = ["Preliminar"]
-                    archivo_zip_opts = [
-                        f"PMI_{case_variant}_{year}_PRELIMINAR.zip",
-                        f"PMI_{case_variant}_{year}_Preliminar.zip",
-                    ]
-                for carpeta_stage in carpeta_stage_opts:
-                    for archivo_zip in archivo_zip_opts:
-                        url = (
-                            f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Mensual%2F{year}%2F"
-                            f"{carpeta_mes}%2F{carpeta_stage}%2F{archivo_zip}"
-                        )
-                        candidates.append(url)
+                archivo_zip_opts = [
+                    f"PMI_{case_variant}_{year}_PRELIMINAR.zip",
+                    f"PMI_{case_variant}_{year}_Preliminar.zip",
+                ]
+                for archivo_zip in archivo_zip_opts:
+                    url = (
+                        f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Mensual%2F{year}%2F"
+                        f"{carpeta_mes}%2FPreliminar%2F{archivo_zip}"
+                    )
+                    candidates.append(url)
         seen, unique = set(), []
         for c in candidates:
             if c not in seen:
@@ -296,15 +288,15 @@ with tab_preliminar:
                 unique.append(c)
         return unique
 
-    def download_and_extract_preliminar(year, month, stage):
+    def download_and_extract_preliminar(year, month):
         mes_display = MESES[month]
         headers = {"User-Agent": "Mozilla/5.0"}
-        candidates = generate_url_candidates_preliminar(year, month, stage)
+        candidates = generate_url_candidates_preliminar(year, month)
         url, content, tried = fetch_valid_zip(candidates, headers)
         if url is None:
             detail = "\n".join(f"  [{status}] {u}" for u, status in tried)
             raise RuntimeError(
-                f"No se encontró un ZIP válido para {mes_display} {year} ({stage}) tras probar "
+                f"No se encontró un ZIP válido para {mes_display} {year} (Preliminar) tras probar "
                 f"{len(tried)} variante(s):\n{detail}"
             )
 
@@ -318,7 +310,7 @@ with tab_preliminar:
             if not excel_files:
                 raise FileNotFoundError(
                     f"No se encontró Anexo1_Intervenciones_(Agentes) en el ZIP de {mes_display} {year} "
-                    f"({stage}) (url usada: {url}). Archivos disponibles: {namelist}"
+                    f"(Preliminar) (url usada: {url}). Archivos disponibles: {namelist}"
                 )
             excel_name = excel_files[0]
             with z.open(excel_name) as excel_file:
@@ -331,8 +323,6 @@ with tab_preliminar:
                     usecols=list(range(start_idx, end_idx + 1)),
                 )
                 df = df.dropna(how="all").reset_index(drop=True)
-                df["PERIODO"] = f"{mes_display}_{year}"
-                df["ESTADO_PROGRAMA"] = stage.upper()
         return df, url, tried
 
     if st.button("🚀 Descargar y consolidar (Preliminar)", type="primary", key="btn_preliminar"):
@@ -346,13 +336,13 @@ with tab_preliminar:
 
             with ThreadPoolExecutor(max_workers=max_workers_pre) as executor:
                 futures = {
-                    executor.submit(download_and_extract_preliminar, y, m, stage_pre): (y, m)
+                    executor.submit(download_and_extract_preliminar, y, m): (y, m)
                     for y, m in periodos_pre
                 }
                 done = 0
                 for future in as_completed(futures):
                     y, m = futures[future]
-                    label = f"{MESES[m]} {y} ({stage_pre})"
+                    label = f"{MESES[m]} {y} (Preliminar)"
                     try:
                         df, used_url, tried = future.result()
                         results.append(df)
