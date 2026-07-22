@@ -161,9 +161,6 @@ with tab_mensual:
                     usecols=list(range(start_idx, end_idx + 1)),
                 )
                 df = df.dropna(how="all").reset_index(drop=True)
-                df["_year"] = year
-                df["_month"] = month
-                df["_periodo"] = f"{mes_display} {year}"
         return df, url, tried
 
     if st.button("🚀 Descargar y consolidar (Mensual)", type="primary", key="btn_mensual"):
