@@ -19,6 +19,9 @@ st.markdown(
 Descarga automáticamente el archivo **Anexo1_Intervenciones_(Agentes)** del Programa
 Mensual de Mantenimiento publicado por COES, para uno o varios periodos (año/mes),
 y consolida todo en una sola tabla.
+
+Como el nombre exacto del ZIP puede variar de un mes a otro (mayúsculas, tildes, etc.),
+la app prueba automáticamente varias variantes del nombre antes de descargar.
 """
 )
 
@@ -28,22 +31,26 @@ MESES = {
     9: "SETIEMBRE", 10: "OCTUBRE", 11: "NOVIEMBRE", 12: "DICIEMBRE",
 }
 
-DEFAULT_OUTPUT = r"C:\Users\GZ6710\OneDrive - ENGIE\Escritorio\ENGIE\2026\Plexos\SCRIPT\PMENSUAL_2026.xlsx"
+# Nombres de mes alternativos que a veces usa COES para el mismo mes
+MESES_ALT = {
+    9: ["SEPTIEMBRE"],
+}
 
 # =========================
-# SIDEBAR
+# CONFIG FIJA (antes eran inputs en el sidebar; ahora se fijan en el código)
+# =========================
+SHEET_NAME = "MANTTOS"
+HEADER_ROW = 9      # numeración de Excel, 1-indexed
+COL_START = "B"
+COL_END = "Q"
+
+# =========================
+# SIDEBAR (simplificado)
 # =========================
 with st.sidebar:
     st.header("⚙️ Configuración")
-    output_path = st.text_input("Ruta de salida (.xlsx)", value=DEFAULT_OUTPUT)
     max_workers = st.slider("Descargas en paralelo", min_value=1, max_value=6, value=3)
-    st.markdown("---")
-    sheet_name = st.text_input("Nombre de hoja", value="MANTTOS")
-    header_row = st.number_input(
-        "Fila de encabezado (numeración de Excel, 1-indexed)", min_value=1, value=9
-    )
-    col_start = st.text_input("Columna inicial", value="B")
-    col_end = st.text_input("Columna final", value="Q")
+    show_debug = st.checkbox("Mostrar variantes de URL probadas (debug)", value=False)
 
 # =========================
 # SELECCIÓN DE PERIODOS
@@ -65,22 +72,65 @@ st.caption(f"Se descargarán {len(periodos)} periodo(s).")
 
 
 # =========================
-# HELPERS
+# HELPERS: generación de candidatos de URL
 # =========================
-def generate_url(year, month):
+def get_month_name_variants(month: int):
+    """Todas las variantes de nombre de mes a probar para un mes dado."""
+    return [MESES[month]] + MESES_ALT.get(month, [])
+
+
+def generate_url_candidates(year: int, month: int):
     """
-    Construye la URL de descarga del Programa Mensual para un año y mes dados.
-    Ej: 2026, 7 -> .../Programa Mensual/2026/07_JULIO/Final/PMENSUAL_JULIO_2026.zip
+    Genera una lista de URLs candidatas para el ZIP del Programa Mensual,
+    probando variantes de nombre de mes y de mayúsculas/minúsculas del archivo.
     """
-    mes_nombre = MESES[month]
-    carpeta_mes = f"{month:02d}_{mes_nombre}"
-    archivo_zip = f"PMENSUAL_{mes_nombre}_{year}.zip"
-    url = (
-        f"https://www.coes.org.pe/portal/browser/download?url="
-        f"Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Mensual%2F{year}%2F"
-        f"{carpeta_mes}%2FFinal%2F{archivo_zip}"
-    )
-    return url
+    candidates = []
+    for mes_nombre in get_month_name_variants(month):
+        carpeta_mes = f"{month:02d}_{mes_nombre}"
+        for case_variant in {mes_nombre, mes_nombre.title(), mes_nombre.capitalize()}:
+            archivo_zip = f"PMENSUAL_{case_variant}_{year}.zip"
+            url = (
+                f"https://www.coes.org.pe/portal/browser/download?url="
+                f"Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Mensual%2F{year}%2F"
+                f"{carpeta_mes}%2FFinal%2F{archivo_zip}"
+            )
+            candidates.append(url)
+
+    # dedupe preservando el orden
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+
+def find_working_url(year: int, month: int, headers: dict, timeout: int = 20):
+    """
+    Prueba cada URL candidata con un HEAD (o GET en streaming si el servidor
+    no soporta HEAD) y devuelve la primera que responda 200, junto con el
+    detalle completo de lo probado (para diagnóstico).
+    """
+    tried = []
+    for url in generate_url_candidates(year, month):
+        status = None
+        try:
+            resp = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+            status = resp.status_code
+            if status in (405, 501):  # servidor no soporta HEAD -> probar GET en streaming
+                resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+                status = resp.status_code
+                resp.close()
+        except Exception as e:
+            tried.append((url, f"ERROR: {e}"))
+            continue
+
+        tried.append((url, status))
+        if status == 200:
+            return url, tried
+
+    return None, tried
 
 
 def col_letter_to_index(letter: str) -> int:
@@ -91,14 +141,24 @@ def col_letter_to_index(letter: str) -> int:
     return result - 1
 
 
-def download_and_extract(year, month, sheet_name, header_row, col_start, col_end):
-    url = generate_url(year, month)
-    mes_nombre = MESES[month]
+# =========================
+# DESCARGA Y PROCESAMIENTO
+# =========================
+def download_and_extract(year, month):
+    mes_display = MESES[month]
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    url, tried = find_working_url(year, month, headers)
+    if url is None:
+        detail = "\n".join(f"  [{status}] {u}" for u, status in tried)
+        raise RuntimeError(
+            f"No se encontró un ZIP válido para {mes_display} {year} tras probar "
+            f"{len(tried)} variante(s):\n{detail}"
+        )
 
     response = requests.get(url, headers=headers, timeout=60)
     if response.status_code != 200:
-        raise RuntimeError(f"HTTP {response.status_code} al descargar {mes_nombre} {year} (url: {url})")
+        raise RuntimeError(f"HTTP {response.status_code} al descargar {mes_display} {year} (url: {url})")
 
     with zipfile.ZipFile(io.BytesIO(response.content)) as z:
         namelist = z.namelist()
@@ -109,25 +169,26 @@ def download_and_extract(year, month, sheet_name, header_row, col_start, col_end
         ]
         if not excel_files:
             raise FileNotFoundError(
-                f"No se encontró Anexo1_Intervenciones_(Agentes) en el ZIP de {mes_nombre} {year}. "
-                f"Archivos disponibles: {namelist}"
+                f"No se encontró Anexo1_Intervenciones_(Agentes) en el ZIP de {mes_display} {year} "
+                f"(url usada: {url}). Archivos disponibles: {namelist}"
             )
 
         excel_name = excel_files[0]
         with z.open(excel_name) as excel_file:
-            start_idx = col_letter_to_index(col_start)
-            end_idx = col_letter_to_index(col_end)
+            start_idx = col_letter_to_index(COL_START)
+            end_idx = col_letter_to_index(COL_END)
             df = pd.read_excel(
                 io.BytesIO(excel_file.read()),
-                sheet_name=sheet_name,
-                header=header_row - 1,  # 1-indexed en la UI -> 0-indexed para pandas
+                sheet_name=SHEET_NAME,
+                header=HEADER_ROW - 1,  # 1-indexed -> 0-indexed para pandas
                 usecols=list(range(start_idx, end_idx + 1)),
             )
             df = df.dropna(how="all").reset_index(drop=True)
             df["_year"] = year
             df["_month"] = month
-            df["_periodo"] = f"{mes_nombre} {year}"
-            return df
+            df["_periodo"] = f"{mes_display} {year}"
+
+    return df, url, tried
 
 
 # =========================
@@ -139,6 +200,7 @@ if st.button("🚀 Descargar y consolidar", type="primary"):
     else:
         results = []
         errors = []
+        debug_info = []
 
         progress = st.progress(0.0)
         status = st.empty()
@@ -146,22 +208,23 @@ if st.button("🚀 Descargar y consolidar", type="primary"):
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(
-                    download_and_extract, y, m, sheet_name, header_row, col_start, col_end
-                ): (y, m)
+                executor.submit(download_and_extract, y, m): (y, m)
                 for y, m in periodos
             }
 
             done = 0
             for future in as_completed(futures):
                 y, m = futures[future]
+                periodo_label = f"{MESES[m]} {y}"
                 try:
-                    results.append(future.result())
+                    df, used_url, tried = future.result()
+                    results.append(df)
+                    debug_info.append({"periodo": periodo_label, "used_url": used_url, "tried": tried})
                 except Exception as e:
-                    errors.append(f"{MESES[m]} {y}: {e}")
+                    errors.append(f"{periodo_label}: {e}")
                 done += 1
                 progress.progress(done / len(futures))
-                status.text(f"Procesados {done}/{len(futures)} — último: {MESES[m]} {y}")
+                status.text(f"Procesados {done}/{len(futures)} — último: {periodo_label}")
 
         elapsed = time.time() - t0
         status.empty()
@@ -173,17 +236,17 @@ if st.button("🚀 Descargar y consolidar", type="primary"):
                 for e in errors:
                     st.text(e)
 
+        if show_debug and debug_info:
+            with st.expander("🔎 Variantes de URL probadas por periodo", expanded=False):
+                for info in debug_info:
+                    st.markdown(f"**{info['periodo']}** — usada: `{info['used_url']}`")
+                    for u, s in info["tried"]:
+                        st.text(f"  [{s}] {u}")
+
         if results:
             df_final = pd.concat(results, ignore_index=True)
             st.success(f"✅ {len(df_final):,} filas consolidadas de {len(results)} periodo(s).")
             st.dataframe(df_final.head(300), use_container_width=True)
-
-            # Guarda directamente en la ruta local (sobrescribe, igual que el script original)
-            try:
-                df_final.to_excel(output_path, index=False)
-                st.success(f"💾 Guardado en: {output_path}")
-            except Exception as e:
-                st.warning(f"No se pudo guardar en la ruta local ({e}). Usa el botón de descarga.")
 
             # Descarga xlsx
             buf_xlsx = io.BytesIO()
