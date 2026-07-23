@@ -75,10 +75,11 @@ def fetch_valid_zip(candidates, headers, timeout=30):
     return None, None, tried
 
 
-tab_mensual, tab_preliminar, tab_pai = st.tabs([
+tab_mensual, tab_preliminar, tab_pai, tab_pai_preliminar = st.tabs([
     "📅 Programa Mensual (Intervenciones)",
     "📋 Programa Mensual Preliminar (Agentes)",
     "📆 Programa Anual (PAI)",
+    "📝 Programa Anual Preliminar (PAI)",
 ])
 
 # ======================================================================
@@ -598,6 +599,214 @@ with tab_pai:
                 st.download_button(
                     "⬇️ Descargar PAI.csv", data=buf_csv,
                     file_name="PAI.csv", mime="text/csv", key="dl_csv_pai",
+                )
+            else:
+                st.error("❌ No se consolidó ninguna combinación de año/ciclo.")
+
+
+# ======================================================================
+# TAB 4: PROGRAMA ANUAL PRELIMINAR (PAI) — LISTADO_Mantto, versión Preliminar
+# ======================================================================
+with tab_pai_preliminar:
+    st.markdown(
+        """
+    Descarga la versión **Preliminar** del PAI (Programa Anual de Mantenimiento), antes de
+    que exista la versión Final. La ruta de esta versión es distinta a la del PAI Final.
+    """
+    )
+    st.caption(
+        "Esta ruta suele cambiar de nombre entre ciclos y años (subcarpetas de reunión, "
+        "sufijos de versión como 'PRELIMINAR2'). Si la detección automática falla, usa "
+        "las opciones avanzadas para forzarla."
+    )
+
+    SHEET_PAI_PRE = "MANTTOS"
+    HEADER_PAI_PRE = 9
+    COL_RANGE_PAI_PRE = "B:Q"
+
+    # Valores por defecto confirmados con ejemplos reales de 2026 (ambos ciclos comparten
+    # la misma subcarpeta final y el mismo prefijo, solo cambia la carpeta del ciclo)
+    MIDDLE_FOLDER_PAI_PRE = "02_Elaboración"
+    FINAL_SUBFOLDER_PAI_PRE = {
+        1: "03_Reunión Final",
+        2: "03_Reunión Final",
+    }
+    PREFIX_PAI_PRE = {
+        1: "PAI",
+        2: "PAI",
+    }
+    SUFFIX_OPTIONS_PAI_PRE = ["PRELIMINAR", "PRELIMINAR2", "PRELIMINAR3", "Preliminar", "Preliminar2", "Preliminar3"]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        years_pp = st.multiselect("Año(s)", options=list(range(2022, 2031)), default=[2026], key="years_pai_pre")
+    with col2:
+        cycles_pp = st.multiselect(
+            "Ciclo(s) PAI",
+            options=list(PAI_CYCLES.keys()),
+            default=[1, 2],
+            format_func=lambda c: PAI_CYCLES[c]["label"],
+            key="cycles_pai_pre",
+        )
+
+    with st.expander("⚙️ Opciones avanzadas", expanded=False):
+        max_workers_pp = st.slider("Descargas en paralelo", 1, 6, 3, key="workers_pai_pre")
+        show_debug_pp = st.checkbox("Mostrar variantes de URL probadas (debug)", key="debug_pai_pre")
+        st.caption("Forzar manualmente si la detección automática no encuentra el archivo correcto:")
+        middle_override_pp = st.text_input(
+            "Forzar subcarpeta intermedia (dejar vacío = '02_Elaboración')", value="", key="middle_override_pai_pre"
+        )
+        final_override_pp = st.text_input(
+            "Forzar subcarpeta final (dejar vacío = probar automáticamente por ciclo)", value="", key="final_override_pai_pre"
+        )
+        prefix_override_pp = st.text_input(
+            "Forzar prefijo del ZIP (dejar vacío = 'PRIMER PAI' / 'PAI')", value="", key="prefix_override_pai_pre"
+        )
+        suffix_override_pp = st.text_input(
+            "Forzar sufijo (dejar vacío = probar 'PRELIMINAR', 'PRELIMINAR2', etc.)", value="", key="suffix_override_pai_pre"
+        )
+
+    periodos_pp = [(y, c) for y in sorted(years_pp) for c in sorted(cycles_pp)]
+    st.caption(f"Se descargarán {len(periodos_pp)} combinación(es) de año/ciclo.")
+
+    def generate_url_candidates_pai_preliminar(year, cycle, middle_override, final_override, prefix_override, suffix_override):
+        ciclo_folder_variants = build_ciclo_folder_variants(year, cycle)
+
+        middle_base = middle_override if middle_override else MIDDLE_FOLDER_PAI_PRE
+        middle_folders = [middle_base] if middle_override else [middle_base, f" {middle_base}"]
+
+        final_base = final_override if final_override else FINAL_SUBFOLDER_PAI_PRE[cycle]
+        final_folders = [final_base] if final_override else [final_base, f" {final_base}"]
+
+        default_prefix = PREFIX_PAI_PRE[cycle]
+        if prefix_override:
+            prefixes = [prefix_override]
+        else:
+            prefixes = [default_prefix, default_prefix.replace(" ", "_")]
+
+        suffixes = [suffix_override] if suffix_override else SUFFIX_OPTIONS_PAI_PRE
+
+        candidates = []
+        for ciclo_folder in ciclo_folder_variants:
+            for middle in middle_folders:
+                for finalsub in final_folders:
+                    for pfx in prefixes:
+                        for suf in suffixes:
+                            archivo_zip = f"{pfx} {year}-{suf}.zip"
+                            url = (
+                                f"{BASE_URL}Operaci%C3%B3n%2FPrograma%20de%20Mantenimiento%2FPrograma%20Anual%2F{year}%2F"
+                                f"{quote(ciclo_folder)}%2F{quote(middle)}%2F{quote(finalsub)}%2F{quote(archivo_zip)}"
+                            )
+                            candidates.append(url)
+
+        seen, unique = set(), []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        return unique
+
+    def download_and_extract_pai_preliminar(year, cycle, middle_override, final_override, prefix_override, suffix_override):
+        cycle_label = PAI_CYCLES[cycle]["label"]
+        headers = {"User-Agent": "Mozilla/5.0"}
+        candidates = generate_url_candidates_pai_preliminar(
+            year, cycle, middle_override, final_override, prefix_override, suffix_override
+        )
+        url, content, tried = fetch_valid_zip(candidates, headers)
+        if url is None:
+            detail = "\n".join(f"  [{status}] {u}" for u, status in tried)
+            raise RuntimeError(
+                f"No se encontró un ZIP válido (Preliminar) para {cycle_label} {year} tras probar "
+                f"{len(tried)} variante(s):\n{detail}"
+            )
+
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            namelist = z.namelist()
+            excel_files = [
+                f for f in namelist
+                if "LISTADO_Mantto" in f and (f.endswith(".xlsx") or f.endswith(".xlsm"))
+            ]
+            if not excel_files:
+                raise FileNotFoundError(
+                    f"No se encontró LISTADO_Mantto en el ZIP Preliminar de {cycle_label} {year} (url: {url}). "
+                    f"Archivos disponibles: {namelist}"
+                )
+            excel_name = excel_files[0]
+            with z.open(excel_name) as excel_file:
+                df = pd.read_excel(
+                    io.BytesIO(excel_file.read()),
+                    sheet_name=SHEET_PAI_PRE,
+                    header=HEADER_PAI_PRE - 1,
+                    usecols=COL_RANGE_PAI_PRE,
+                )
+                df = df.dropna(how="all").reset_index(drop=True)
+        return df, url, tried
+
+    if st.button("🚀 Descargar y consolidar (PAI Preliminar)", type="primary", key="btn_pai_pre"):
+        if not periodos_pp:
+            st.error("Selecciona al menos un año y un ciclo.")
+        else:
+            results, errors, debug_info = [], [], []
+            progress = st.progress(0.0)
+            status = st.empty()
+            t0 = time.time()
+
+            with ThreadPoolExecutor(max_workers=max_workers_pp) as executor:
+                futures = {
+                    executor.submit(
+                        download_and_extract_pai_preliminar,
+                        y, c, middle_override_pp, final_override_pp, prefix_override_pp, suffix_override_pp,
+                    ): (y, c)
+                    for y, c in periodos_pp
+                }
+                done = 0
+                for future in as_completed(futures):
+                    y, c = futures[future]
+                    label = f"{PAI_CYCLES[c]['label']} — {y} (Preliminar)"
+                    try:
+                        df, used_url, tried = future.result()
+                        results.append(df)
+                        debug_info.append({"periodo": label, "used_url": used_url, "tried": tried})
+                    except Exception as e:
+                        errors.append(f"{label}: {e}")
+                    done += 1
+                    progress.progress(done / len(futures))
+                    status.text(f"Procesados {done}/{len(futures)} — último: {label}")
+
+            elapsed = time.time() - t0
+            status.empty()
+            progress.empty()
+            st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(periodos_pp)} combinación(es), {max_workers_pp} en paralelo)")
+
+            if errors:
+                with st.expander("⚠️ Errores", expanded=True):
+                    for e in errors:
+                        st.text(e)
+
+            if show_debug_pp and debug_info:
+                with st.expander("🔎 Variantes de URL probadas", expanded=False):
+                    for info in debug_info:
+                        st.markdown(f"**{info['periodo']}** — usada: `{info['used_url']}`")
+                        for u, s in info["tried"]:
+                            st.text(f"  [{s}] {u}")
+
+            if results:
+                df_final_pp = pd.concat(results, ignore_index=True)
+                st.success(f"✅ {len(df_final_pp):,} filas consolidadas de {len(results)} combinación(es).")
+                st.dataframe(df_final_pp.head(300), use_container_width=True)
+
+                buf_xlsx = io.BytesIO()
+                df_final_pp.to_excel(buf_xlsx, index=False, engine="openpyxl")
+                st.download_button(
+                    "⬇️ Descargar PAI_preliminar.xlsx", data=buf_xlsx.getvalue(),
+                    file_name="PAI_preliminar.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_xlsx_pai_pre",
+                )
+                buf_csv = df_final_pp.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Descargar PAI_preliminar.csv", data=buf_csv,
+                    file_name="PAI_preliminar.csv", mime="text/csv", key="dl_csv_pai_pre",
                 )
             else:
                 st.error("❌ No se consolidó ninguna combinación de año/ciclo.")
