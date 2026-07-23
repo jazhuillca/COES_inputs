@@ -724,12 +724,13 @@ with tab_pai_preliminar:
             namelist = z.namelist()
             excel_files = [
                 f for f in namelist
-                if "LISTADO_Mantto" in f and (f.endswith(".xlsx") or f.endswith(".xlsm"))
+                if "LISTADO" in f.upper() and "PAI" in f.upper()
+                and f.endswith((".xlsx", ".xlsm", ".xls"))
             ]
             if not excel_files:
                 raise FileNotFoundError(
-                    f"No se encontró LISTADO_Mantto en el ZIP Preliminar de {cycle_label} {year} (url: {url}). "
-                    f"Archivos disponibles: {namelist}"
+                    f"No se encontró un archivo LISTADO...PAI... en el ZIP Preliminar de {cycle_label} {year} "
+                    f"(url: {url}). Archivos disponibles: {namelist}"
                 )
             excel_name = excel_files[0]
             with z.open(excel_name) as excel_file:
