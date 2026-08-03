@@ -215,16 +215,28 @@ with st.sidebar:
 # =========================================================================
 # EJECUCIÓN
 # =========================================================================
+# --- Persistimos los parámetros de la última búsqueda en session_state.
+# Esto es clave: al presionar un botón de descarga, Streamlit vuelve a ejecutar
+# todo el script y el botón "buscar" deja de estar presionado (vuelve a False).
+# Si el bloque de resultados dependiera solo de `buscar`, desaparecería justo
+# antes de que el navegador complete la descarga. Con session_state, el bloque
+# se sigue mostrando (y descargando_reporte_mantenimientos usa caché, así que
+# no se vuelve a golpear el servidor de COES en cada rerun).
 if buscar:
     if fecha_desde > fecha_hasta:
         st.error("La fecha 'desde' no puede ser posterior a la fecha 'hasta'.")
         st.stop()
+    st.session_state["coes_fetch_params"] = (
+        fecha_desde.strftime("%d/%m/%Y"),
+        fecha_hasta.strftime("%d/%m/%Y"),
+        MANTENIMIENTO_ESTADOS[mantenimiento_sel],
+        mantenimiento_sel,
+    )
 
-    fi = fecha_desde.strftime("%d/%m/%Y")
-    ff = fecha_hasta.strftime("%d/%m/%Y")
-    code = MANTENIMIENTO_ESTADOS[mantenimiento_sel]
+if "coes_fetch_params" in st.session_state:
+    fi, ff, code, mantenimiento_label = st.session_state["coes_fetch_params"]
 
-    with st.spinner(f"Descargando reporte de COES ({fi} a {ff}, {mantenimiento_sel})..."):
+    with st.spinner(f"Descargando reporte de COES ({fi} a {ff}, {mantenimiento_label})..."):
         try:
             raw_bytes = descargar_reporte_mantenimientos(fi, ff, code)
         except Exception as e:
@@ -338,3 +350,8 @@ if buscar:
         )
 else:
     st.info("Configura los filtros en el panel izquierdo y presiona **Descargar y filtrar**.")
+
+if "coes_fetch_params" in st.session_state:
+    if st.sidebar.button("🗑️ Limpiar resultado / nueva búsqueda"):
+        del st.session_state["coes_fetch_params"]
+        st.rerun()
