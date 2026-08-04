@@ -1,357 +1,643 @@
 # -*- coding: utf-8 -*-
 """
-App Streamlit para descargar el reporte de Mantenimientos del COES
-(https://www.coes.org.pe/Portal/eventos/mantenimiento/) y filtrarlo por:
-Tipo de Equipo, Fecha desde/hasta, Mantenimiento (estado), Tipo de Mantenimiento,
-Con Interrupción, Tipo de Empresa y Empresa.
+Streamlit — Descarga de "Medidores de Generación" (COES)
 
-CÓMO FUNCIONA EL FILTRADO
--------------------------
-El formulario web de COES filtra en el servidor usando códigos numéricos internos
-(por ejemplo tiposEquipo=41,42,44,...) que no están documentados públicamente y que
-no se pueden confirmar sin inspeccionar el JavaScript interno del portal. Adivinar
-esos códigos es riesgoso: si uno está mal, el reporte puede salir vacío o incompleto
-sin que te des cuenta.
-
-Por eso esta app usa un enfoque más seguro:
-  1) Se pide SIEMPRE el reporte completo al servidor (con todos los tipos
-     seleccionados, igual que el formulario por defecto), solo variando el rango
-     de fechas y el estado de "Mantenimiento" (Ejecutados / Programado Diario /
-     Programado Semanal / Programado Mensual), que sí están confirmados.
-  2) Una vez descargado el Excel, el filtrado por Tipo de Equipo, Tipo de
-     Mantenimiento, Con Interrupción, Tipo de Empresa y Empresa se hace en
-     pandas, sobre las columnas reales del archivo (texto, no códigos).
-
-Esto es más lento (siempre se trae todo el rango de fechas) pero es exacto.
-
-Ejecutar con:  streamlit run coes_mantenimientos_app.py
+Ejecutar:
+    pip install streamlit requests pandas openpyxl
+    streamlit run app_medidores_generacion.py
 """
 
 import io
-import requests
-import pandas as pd
-import streamlit as st
+import re
+import time
+import unicodedata
+from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from pathlib import Path
 
-# =========================================================================
-# CONFIG
-# =========================================================================
-st.set_page_config(page_title="COES - Consulta de Mantenimientos", layout="wide")
-st.title("🔧 Consulta de Mantenimientos - COES")
+import pandas as pd
+import requests
+import streamlit as st
 
-BASE = "https://www.coes.org.pe/Portal/eventos"
-REFERER = "https://www.coes.org.pe/Portal/eventos/mantenimiento/"
-
-# --- Valores "todos seleccionados" que se envían siempre al servidor ---
-DEFAULT_TIPOS_EQUIPO = (
-    "41,42,44,53,45,46,51,49,50,52,55,43,47,48,54,-1,0,1,2,3,4,5,6,7,8,9,10,"
-    "11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,"
-    "35,40,36,37,38,39,56"
-)
-DEFAULT_TIPOS_MANTTO = "1,2,3,4,5,6,7,9,10,12"
-DEFAULT_TIPOS_EMPRESA_CODES = "1,2,3,4,5"
-
-# --- Estado del mantenimiento: confirmado en el script original que 1=EJECUTADOS.
-# Los otros 3 valores (2,3,4) se asumen por el orden del <select> del formulario;
-# si alguno no coincide, el propio reporte descargado lo evidenciará (columnas
-# vacías o distintas al filtro elegido) y podrás avisarme para corregirlo.
-MANTENIMIENTO_ESTADOS = {
-    "EJECUTADOS": "1",
-    "PROGRAMADO DIARIO": "2",
-    "PROGRAMADO SEMANAL": "3",
-    "PROGRAMADO MENSUAL": "4",
+# ─────────────────────────────────────────────────────────────
+#  CONSTANTES DEL ENDPOINT / FORMULARIO (extraídas del HTML real)
+# ─────────────────────────────────────────────────────────────
+TIPOS_GENERACION = {
+    "EÓLICA": "4",
+    "HIDROELÉCTRICA": "1",
+    "SOLAR": "3",
+    "TERMOELÉCTRICA": "2",
 }
 
-# --- Listas de texto reales, tal como aparecen en el formulario web (para los
-# filtros que aplicamos en pandas sobre el archivo ya descargado) ---
-TIPOS_EQUIPO_LABELS = [
-    "CUENCA HIDROLOGICA", "ESTACIÓN HIDROLÓGICA", "PULVERIZADOR", "RELE PROTECCIONES",
-    "SUMINISTRO", "STATCOM", "TRAMPA DE ONDA", "BESS", "PARTICIPANTE - MME",
-    "CONJUNTO DE LINEAS", "ESQ. DE CONTROL Y PROTECCIÓN", "BLACK START",
-    "TRANSFORMADOR 4D", "TRANSFORMADOR 5D", "COMPONENTE BESS", "(NO DEFINIDO)",
-    "SUBESTACION", "GENERADOR HIDROELÉCTRICO", "GENERADOR TERMOELÉCTRICO",
-    "CENTRAL HIDROELÉCTRICA", "CENTRAL TERMOELÉCTRICA", "CELDA", "BARRA",
-    "LINEA DE TRANSMISION", "TRANSFORMADOR 2D", "TRANSFORMADOR 3D",
-    "BANCO DE CONDENSADOR PARALELO", "REACTOR", "COMPENSADOR SINCRONO", "SVC",
-    "BANCO DE CONDENSADORES SERIE", "INTERRUPTOR", "ACOPLAMIENTO", "TUBERIA",
-    "EMBALSE:PRESA,TAZA,PULMON", "CANAL,TOMA,DESCARGA", "SISTEMA DE BARRAS (SSEE)",
-    "CALDERO", "RIO", "SECCIONADOR", "RELE", "TRANSFORMADOR DE CORRIENTE",
-    "TRANSFORMADOR DE TENSION", "PARARRAYOS", "TRANSFORMADOR ZIG-ZAG",
-    "MOTOR SINCRONO", "MOTOR ASINCRONO", "CLIENTE", "PLANTA", "GASEODUCTO",
-    "CARGA", "SERVICIOS AUXILIARES", "GENERADOR SOLAR", "CENTRAL SOLAR",
-    "GENERADOR EOLICO", "CENTRAL EOLICA",
-]
+CENTRAL_OPCIONES = {
+    "TODOS": "0",
+    "COES": "1",
+    "GENERACION RER": "3",
+}
 
-# Tipos de equipo de generación (los 4 que pediste antes) preseleccionados por defecto
-GENERADORES_DEFAULT = [
-    "GENERADOR HIDROELÉCTRICO",
-    "GENERADOR SOLAR",
-    "GENERADOR TERMOELÉCTRICO",
-    "GENERADOR EOLICO",
-]
+# Mapeo nombre -> ID interno COES, extraído del <select id="cbEmpresas"> real del formulario
+EMPRESAS = {
+    "ACCIONA ENERGIA PERU S.A.C": "14260",
+    "ADINELSA ADN": "69",
+    "AGRO INDUSTRIAL PARAMONGA S.A.": "15214",
+    "AGROAURORA S.A.C.": "11772",
+    "AGROINDUSTRIAS SAN JACINTO S.A.A.": "12439",
+    "AGROLMOS SOCIEDAD ANONIMA - AGROLMOS S.A.": "11777",
+    "AGUAS Y ENERGIA PERU": "10481",
+    "ANDEAN POWER S.A.C.": "12056",
+    "ASOCIACIÓN SANTA LUCIA DE CHACAS": "12362",
+    "ATRIA ENERGIA S.A.C.": "13196",
+    "BIOENERGIA DEL CHIRA S.A.": "12896",
+    "CASA GRANDE S.A.A.": "10628",
+    "CELARIS ENERGY S.A.": "15707",
+    "CELEPSA": "10420",
+    "CELEPSA RENOVABLES S.R.L.": "12708",
+    "CENTRALES SANTA ROSA S.A.C.": "13165",
+    "CHINANGO S.A.C.": "10901",
+    "COENERGY S.A.C.": "15571",
+    "COLCA SOLAR S.A.C.": "12584",
+    "CORPORACION MINERA DEL PERU S.A.": "11095",
+    "EGASA": "17",
+    "EGEJUNIN": "11153",
+    "EGEMSA": "58",
+    "EGESUR": "19",
+    "ELECTRICA YANAPAMPA SAC": "10684",
+    "ELECTRO ORIENTE": "30",
+    "ELECTRO SUR ESTE": "27",
+    "ELECTRO UCAYALI": "40",
+    "ELECTRO ZAÑA S.A.C.": "11228",
+    "ELECTRONOROESTE S.A.": "23",
+    "ELECTRONORTE S.A.": "24",
+    "ELECTROPERU": "2",
+    "EMPRESA DE GENERACION ELECTRICA CANCHAYLLO SAC": "11389",
+    "EMPRESA DE GENERACION ELECTRICA SANTA ANA S.A.C.": "14173",
+    "EMPRESA DE GENERACION HUALLAGA": "11412",
+    "EMPRESA DE GENERACION HUANZA": "206",
+    "EMPRESA ELECTRICA AGUA AZUL": "11544",
+    "EMPRESA ELECTRICA RIO DOBLE": "11058",
+    "ENEL GENERACION PIURA S.A.": "12097",
+    "ENERGÍA EÓLICA S.A.": "10552",
+    "ENERGIA RENOVABLE DEL SUR S.A.": "11429",
+    "ENERGIA RENOVABLE LA JOYA S.A.": "12884",
+    "ENGIE ENERGIA PERU S.A.A.": "15624",
+    "EOLICA CARAVELI S.A.C.": "15392",
+    "FENIX POWER PERÚ": "10725",
+    "GENERACIÓN ANDINA S.A.C.": "11527",
+    "GENERADORA DE ENERGÍA DEL PERÚ": "10647",
+    "GM OPERACIONES S.A.C.": "14973",
+    "GR CORTARRAMA SOCIEDAD ANONIMA CERRADA": "11981",
+    "GR PAINO SOCIEDAD ANONIMA CERRADA": "11840",
+    "GR TARUCA SOCIEDAD ANONIMA CERRADA": "11841",
+    "GR VALE S.A.C.": "12974",
+    "HIDROCAÑETE S.A.": "10974",
+    "HIDROELECTRICA HUANCHOR S.A.C.": "11258",
+    "HIDROELECTRICA RAPAZ S.A.C.": "11644",
+    "HUAURA POWER GROUP S.A.": "11444",
+    "HYDRO GLOBAL PERÚ S.A.C.": "11940",
+    "HYDRO PATAPO S.A.C.": "12364",
+    "ILLAPU ENERGY": "11149",
+    "INFRAESTRUCTURAS Y ENERGIAS DEL PERU S.A.C.": "11528",
+    "INLAND ENERGY SAC": "12634",
+    "INTI JOYA S.A.C.": "15849",
+    "INVERSIONES SHAQSHA S.A.C.": "12624",
+    "JOYA SOLAR S.A.C.": "13726",
+    "KALLPA GENERACION S.A.": "12479",
+    "KONDU SAC": "14807",
+    "LA VIRGEN": "11185",
+    "LUZ DEL SUR": "13",
+    "MAJA ENERGIA S.A.C.": "10916",
+    "MAJES ARCUS S.A.C.": "13965",
+    "MINERA CERRO VERDE": "67",
+    "MINERA CORONA": "108",
+    "MOQUEGUA FV S.A.C.": "11217",
+    "ORAZUL ENERGY PERÚ": "12480",
+    "ORYGEN PERU S.A.A.": "15259",
+    "PANAMERICANA SOLAR SAC.": "11102",
+    "PARQUE EOLICO MARCONA S.A.C.": "13120",
+    "PARQUE EOLICO TRES HERMANAS S.A.C.": "11218",
+    "PETRAMAS": "11063",
+    "PETROPERU": "149",
+    "PLANTA DE RESERVA FRIA DE GENERACION DE ETEN S.A.": "11323",
+    "REPARTICIÓN ARCUS S.A.C.": "13966",
+    "SAMAY I S.A.C": "15009",
+    "SAN GABAN": "61",
+    "SDE PIURA": "10913",
+    "SDF ENERGIA SAC": "10587",
+    "SHOUGESA": "8",
+    "SINERSA": "138",
+    "STATKRAFT S.A": "12758",
+    "TACNA SOLAR SAC.": "11103",
+    "TERMOCHILCA S.A.C.": "15080",
+    "TERMOSELVA": "10",
+    "TRANSMISION ANDINA DE GENERACION S.A.C.": "15683",
+    "UNACEM PERU S.A.": "14342",
+    "VARI ENERGIA S.A.C.": "13984",
+    "YURA": "167",
+    "AGRO INDUSTRIAL PARAMONGA": "10422",
+    "CEMENTO ANDINO": "180",
+    "CERRO DEL AGUILA S.A.": "11146",
+    "COGENERACION OQUENDO SAC": "15014",
+    "EDEGEL": "4",
+    "EEPSA": "5",
+    "EGENOR": "9",
+    "ELECTRICA SANTA ROSA": "76",
+    "EMPRESA CONCESIONARIA ENERGIA LIMPIA SAC": "11563",
+    "EMPRESA DE GENERACIÓN ELÉCTRICA CHEVES S.A.": "10636",
+    "EMPRESA DE GENERACION ELECTRICA RIO BAÑOS S.A.C.": "11129",
+    "EMPRESA DE GENERACION ELECTRICA SANTA ANA": "11509",
+    "ENEL GENERACION PERU S.A.A.": "12096",
+    "ENEL GREEN POWER PERU S.A.": "11395",
+    "ENEL GREEN POWER PERU S.A.C": "13783",
+    "ENERSUR": "18",
+    "ENGIE": "48",
+    "HIDROELECTRICA SANTA CRUZ": "10582",
+    "HIDROMARAÑON": "11064",
+    "KALLPA GENERACION": "47",
+    "MAJES ARCUS": "11100",
+    "MAPLE ETANOL": "10755",
+    "ORAZUL ENERGY": "12190",
+    "PARQUE EOLICO MARCONA S.R.L.": "11053",
+    "PERUANA DE INVERSIONES EN ENERGIAS RENOVABLES S.A.": "10984",
+    "REPARTICIÓN ARCUS": "11101",
+    "SAMAY I S.A.": "11486",
+    "SN POWER": "6",
+    "STATKRAFT": "11567",
+    "TERMOCHILCA": "10767",
+    "UNION ANDINA DE CEMENTO": "11894",
+}
 
-TIPOS_MANTTO_LABELS = [
-    "MANTENIMIENTO PREVENTIVO", "MANTENIMIENTO CORRECTIVO", "AMPLIACION Y/O MEJORAS",
-    "EVENTO", "FALLA", "PRUEBAS", "FALLA ENVIO ICCP", "OTROS",
-    "ENERGIZACION DE NUEVOS EQUIPOS O INSTALACIONES", "SEGURIDAD DE LAS PERSONAS",
-]
+PARAMETROS_EXPORTAR = {
+    "Potencia Activa (MW)": "1",
+    "Potencia Reactiva (MW)": "5",
+    "Servicios Auxiliares": "3",
+    "Potencia Reactiva Capacitiva (MVAR)": "2",
+    "Potencia Reactiva Inductiva (MVAR)": "4",
+}
 
-TIPOS_EMPRESA_LABELS = [
-    "TRANSMISION", "DISTRIBUCION", "GENERACION", "USUARIO LIBRE", "FALTA DEFINIR",
-]
+FORMATOS = {
+    "Excel Horizontal": "1",
+    "Excel Vertical": "2",
+    "CSV": "3",
+}
 
-INTERRUPCION_OPCIONES = ["--TODOS--", "SI", "NO"]
+FORMATO_EXTENSION = {"1": "xlsx", "2": "xlsx", "3": "csv"}
+
+URL_PAGINA          = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
+URL_VALIDAR_EXPORT  = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/validarexportacion"
+URL_EXPORTAR        = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar"
+URL_DESCARGAR       = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/descargar"
+
+MENSAJES_VALIDACION = {
+    2: "El lapso de tiempo no puede ser mayor a 1 mes.",
+    3: "Para la exportación a CSV solo debe seleccionar un parámetro.",
+    4: "Seleccione un parámetro a exportar.",
+    -1: "Ha ocurrido un error en el servidor al validar la exportación.",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": URL_PAGINA,
+    "Origin": "https://www.coes.org.pe",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+}
 
 
-# =========================================================================
-# DESCARGA DEL REPORTE (server-side: solo fecha + estado de mantenimiento)
-# =========================================================================
-def _session():
+def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": REFERER,
-        "Origin": "https://www.coes.org.pe",
-    })
-    s.get(REFERER, timeout=30)
+    s.headers.update(HEADERS)
+    s.get(URL_PAGINA, timeout=30)  # cookies de sesión
     return s
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def descargar_reporte_mantenimientos(fecha_inicial: str, fecha_final: str, tipo_mantenimiento_code: str) -> bytes:
+def _nombre_desde_content_disposition(resp: requests.Response, default: str) -> str:
+    cd = resp.headers.get("Content-Disposition", "")
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+    if m:
+        return m.group(1)
+    return default
+
+
+def descargar_medidores_generacion(
+    fecha_inicial: str,
+    fecha_final: str,
+    empresas: str,
+    tipos_generacion: str,
+    central: str,
+    parametros: str,
+    tipo: str,
+    tipos_empresa: str = "",
+):
     """
-    fecha_inicial / fecha_final: strings dd/mm/yyyy.
-    tipo_mantenimiento_code: código del estado (ver MANTENIMIENTO_ESTADOS).
-    Devuelve los bytes crudos del Excel descargado.
+    Replica el flujo real del sitio (medidores.js -> exportarFormato):
+      1) POST validarexportacion
+      2) POST exportar
+      3) GET descargar?tipo=...
+
+    Devuelve (contenido_bytes, nombre_archivo, mensaje_error).
     """
     s = _session()
 
-    payload = {
-        "tiposMantenimiento": tipo_mantenimiento_code,
+    # ── Paso 1: validar ─────────────────────────────────────────
+    payload_validar = {
+        "formato": tipo,
         "fechaInicial": fecha_inicial,
         "fechaFinal": fecha_final,
-        "indispo": "-1",
-        "tiposEmpresa": DEFAULT_TIPOS_EMPRESA_CODES,
-        "empresas": "-1",
-        "tiposEquipo": DEFAULT_TIPOS_EQUIPO,
-        "interrupcion": "-1",
-        "tiposMantto": DEFAULT_TIPOS_MANTTO,
+        "parametros": parametros,
     }
+    try:
+        resp1 = s.post(URL_VALIDAR_EXPORT, data=payload_validar, timeout=60)
+    except requests.RequestException as e:
+        return None, None, f"Error de conexión en validarexportacion: {e}"
 
-    resp = s.post(f"{BASE}/mantenimiento/GenerarArchivoReporte", data=payload, timeout=90)
-    resp.raise_for_status()
+    if resp1.status_code != 200:
+        return None, None, f"HTTP {resp1.status_code} en validarexportacion: {resp1.text[:300]}"
 
     try:
-        resultado = resp.json()
+        resultado_validar = resp1.json()
     except ValueError:
-        resultado = resp.text.strip()
+        return None, None, f"Respuesta inesperada en validarexportacion: {resp1.text[:300]}"
 
-    if str(resultado) != "1":
-        raise RuntimeError(f"El servidor de COES no confirmó éxito al generar el reporte (respuesta: {resultado!r}).")
+    if resultado_validar != 1:
+        mensaje = MENSAJES_VALIDACION.get(
+            resultado_validar, f"Validación falló con código {resultado_validar!r}"
+        )
+        return None, None, mensaje
 
-    descarga = s.get(f"{BASE}/mantenimiento/ExportarReporte", params={"tipo": 0}, timeout=90)
-    descarga.raise_for_status()
+    # ── Paso 2: exportar (genera el archivo en la sesión del servidor) ──
+    payload_exportar = {
+        "fechaInicial": fecha_inicial,
+        "fechaFinal": fecha_final,
+        "tiposEmpresa": tipos_empresa,
+        "empresas": empresas,
+        "tiposGeneracion": tipos_generacion,
+        "central": central,
+        "parametros": parametros,
+        "tipo": tipo,
+    }
+    try:
+        resp2 = s.post(URL_EXPORTAR, data=payload_exportar, timeout=90)
+    except requests.RequestException as e:
+        return None, None, f"Error de conexión en exportar: {e}"
 
-    content_type = descarga.headers.get("Content-Type", "")
-    if "spreadsheet" not in content_type and "excel" not in content_type and "octet-stream" not in content_type:
-        raise RuntimeError(
-            f"COES no devolvió un Excel válido (Content-Type={content_type!r}). "
-            f"Puede que el rango de fechas sea muy amplio o que la sesión haya expirado."
+    if resp2.status_code != 200:
+        return None, None, f"HTTP {resp2.status_code} en exportar: {resp2.text[:300]}"
+
+    try:
+        resultado_exportar = resp2.json()
+    except ValueError:
+        return None, None, f"Respuesta inesperada en exportar: {resp2.text[:300]}"
+
+    if str(resultado_exportar) != "1":
+        return None, None, f"exportar devolvió un error: {resultado_exportar!r}"
+
+    # ── Paso 3: descargar el archivo ya generado ────────────────
+    try:
+        resp3 = s.get(URL_DESCARGAR, params={"tipo": tipo}, timeout=90)
+    except requests.RequestException as e:
+        return None, None, f"Error de conexión en descargar: {e}"
+
+    if resp3.status_code != 200:
+        return None, None, f"HTTP {resp3.status_code} en descargar: {resp3.text[:300]}"
+
+    ext_default = FORMATO_EXTENSION.get(tipo, "xlsx")
+    nombre_default = (
+        f"MedidoresGeneracion_{fecha_inicial.replace('/', '')}_"
+        f"{fecha_final.replace('/', '')}.{ext_default}"
+    )
+    nombre = _nombre_desde_content_disposition(resp3, default=nombre_default)
+    nombre = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode()
+
+    return resp3.content, nombre, None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _descargar_tramo_cacheado(
+    fecha_inicial: str,
+    fecha_final: str,
+    empresas: str,
+    tipos_generacion: str,
+    central: str,
+    parametros: str,
+    tipo: str,
+):
+    """Wrapper cacheado de descargar_medidores_generacion: mismos params ->
+    no se vuelve a golpear el servidor de COES (clave para que los botones
+    de descarga, que fuerzan un rerun de todo el script, no disparen
+    peticiones nuevas)."""
+    return descargar_medidores_generacion(
+        fecha_inicial=fecha_inicial,
+        fecha_final=fecha_final,
+        empresas=empresas,
+        tipos_generacion=tipos_generacion,
+        central=central,
+        parametros=parametros,
+        tipo=tipo,
+    )
+
+
+def dividir_en_meses(fecha_inicio: date, fecha_fin: date):
+    """
+    Divide [fecha_inicio, fecha_fin] en tramos que respetan el límite de
+    1 mes que exige el servidor. Cada tramo va del día de inicio hasta el
+    mismo día del mes siguiente menos uno (o el fin real, lo que sea antes).
+    """
+    tramos = []
+    actual = fecha_inicio
+    while actual <= fecha_fin:
+        # Fin de tramo: mismo día un mes después, menos 1 día
+        mes = actual.month + 1
+        anio = actual.year
+        if mes > 12:
+            mes = 1
+            anio += 1
+        ultimo_dia_mes_destino = monthrange(anio, mes)[1]
+        dia = min(actual.day, ultimo_dia_mes_destino)
+        fin_tramo = date(anio, mes, dia) - timedelta(days=1)
+
+        if fin_tramo > fecha_fin:
+            fin_tramo = fecha_fin
+
+        tramos.append((actual, fin_tramo))
+        actual = fin_tramo + timedelta(days=1)
+
+    return tramos
+
+
+# ─────────────────────────────────────────────────────────────
+#  INTERFAZ STREAMLIT
+# ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Medidores de Generación — COES", page_icon="⚡", layout="centered")
+
+st.title("⚡ Medidores de Generación — COES")
+st.caption("Descarga directa desde el portal COES (mediciones/medidoresgeneracion)")
+
+# IMPORTANTE: estos filtros van FUERA de un st.form a propósito.
+# Dentro de un st.form, Streamlit no vuelve a ejecutar el script hasta
+# que se presiona el botón de submit, así que un checkbox "TODOS" no
+# podría habilitar/deshabilitar el multiselect en tiempo real. Al
+# dejarlos sueltos, cada clic dispara un rerun inmediato.
+
+st.subheader("Rango de fechas")
+st.caption(
+    "El portal solo permite consultar 1 mes por request; si eliges un rango "
+    "mayor, la app descarga mes por mes y consolida todo en un solo Excel."
+)
+col1, col2 = st.columns(2)
+with col1:
+    fecha_inicial = st.date_input("Fecha inicial", value=date.today().replace(day=1))
+with col2:
+    fecha_final = st.date_input("Fecha final", value=date.today())
+
+st.divider()
+st.subheader(f"Empresa ({len(EMPRESAS)} agentes)")
+todos_empresas = st.checkbox("TODOS los agentes", value=True, key="chk_empresas")
+empresas_sel = st.multiselect(
+    "Selecciona empresa(s)",
+    options=sorted(EMPRESAS.keys()),
+    default=[],
+    disabled=todos_empresas,
+    help="Escribe para filtrar por nombre.",
+)
+
+st.divider()
+st.subheader("Tipo de Generación")
+todos_tipo_gen = st.checkbox("TODOS los tipos", value=True, key="chk_tipo_gen")
+tipo_gen_sel = st.multiselect(
+    "Selecciona tipo(s) de generación",
+    options=list(TIPOS_GENERACION.keys()),
+    default=list(TIPOS_GENERACION.keys()),
+    disabled=todos_tipo_gen,
+)
+
+st.divider()
+st.subheader("Central / Alcance")
+central_sel = st.radio(
+    "Filtro de central",
+    options=list(CENTRAL_OPCIONES.keys()),
+    index=0,  # TODOS
+    horizontal=True,
+)
+
+st.divider()
+st.subheader("Parámetro (a exportar)")
+todos_parametros = st.checkbox("TODOS los parámetros", value=True, key="chk_param")
+parametros_sel = st.multiselect(
+    "Selecciona parámetro(s)",
+    options=list(PARAMETROS_EXPORTAR.keys()),
+    default=list(PARAMETROS_EXPORTAR.keys()),
+    disabled=todos_parametros,
+)
+
+st.divider()
+st.subheader("Formato de salida")
+formato_sel = st.radio(
+    "Formato",
+    options=list(FORMATOS.keys()),
+    index=0,  # Excel Horizontal
+    horizontal=True,
+)
+
+st.divider()
+with st.expander("⚙️ Opciones avanzadas", expanded=False):
+    max_workers = st.slider("Descargas en paralelo (para rangos >1 mes)", 1, 6, 3)
+
+st.divider()
+submitted = st.button("📥 Descargar", use_container_width=True, type="primary")
+
+
+# ─────────────────────────────────────────────────────────────
+#  IMPORTANTE: persistencia con session_state
+#  Al presionar cualquier st.download_button, Streamlit vuelve a correr
+#  todo el script desde arriba y `submitted` vuelve a False. Si el bloque
+#  de resultados dependiera solo de `if submitted:`, desaparecería justo
+#  antes de que el navegador termine de guardar el archivo. Por eso los
+#  parámetros de la última búsqueda se guardan en session_state, y el
+#  bloque de resultados se muestra mientras existan ahí — la descarga
+#  real usa caché (_descargar_tramo_cacheado), así que no se vuelve a
+#  golpear el servidor de COES en cada rerun.
+# ─────────────────────────────────────────────────────────────
+if submitted:
+    if fecha_inicial > fecha_final:
+        st.error("La fecha inicial no puede ser posterior a la fecha final.")
+        st.stop()
+    if not todos_empresas and not empresas_sel:
+        st.error("Selecciona al menos una empresa (o marca TODOS los agentes).")
+        st.stop()
+    if not todos_tipo_gen and not tipo_gen_sel:
+        st.error("Selecciona al menos un tipo de generación (o marca TODOS).")
+        st.stop()
+    if not todos_parametros and not parametros_sel:
+        st.error("Selecciona al menos un parámetro (o marca TODOS).")
+        st.stop()
+
+    empresas_val = (
+        ",".join(EMPRESAS.values()) if todos_empresas
+        else ",".join(EMPRESAS[nombre] for nombre in empresas_sel)
+    )
+    tipo_gen_val = (
+        ",".join(TIPOS_GENERACION.values())
+        if todos_tipo_gen
+        else ",".join(TIPOS_GENERACION[t] for t in tipo_gen_sel)
+    )
+    central_val = CENTRAL_OPCIONES[central_sel]
+    parametros_val = (
+        ",".join(PARAMETROS_EXPORTAR.values())
+        if todos_parametros
+        else ",".join(PARAMETROS_EXPORTAR[p] for p in parametros_sel)
+    )
+    formato_val = FORMATOS[formato_sel]
+
+    st.session_state["medidores_params"] = dict(
+        fecha_inicial=fecha_inicial,
+        fecha_final=fecha_final,
+        empresas_val=empresas_val,
+        tipo_gen_val=tipo_gen_val,
+        central_val=central_val,
+        parametros_val=parametros_val,
+        formato_val=formato_val,
+        max_workers=max_workers,
+    )
+
+
+if "medidores_params" in st.session_state:
+    p = st.session_state["medidores_params"]
+    tramos = dividir_en_meses(p["fecha_inicial"], p["fecha_final"])
+
+    if len(tramos) == 1:
+        # Rango de 1 mes o menos: descarga directa
+        with st.spinner("Consultando el portal COES..."):
+            contenido, nombre, error = _descargar_tramo_cacheado(
+                fecha_inicial=p["fecha_inicial"].strftime("%d/%m/%Y"),
+                fecha_final=p["fecha_final"].strftime("%d/%m/%Y"),
+                empresas=p["empresas_val"],
+                tipos_generacion=p["tipo_gen_val"],
+                central=p["central_val"],
+                parametros=p["parametros_val"],
+                tipo=p["formato_val"],
+            )
+
+        if error:
+            st.error(f"No se pudo descargar: {error}")
+        else:
+            st.success(f"Listo — {nombre}")
+            st.download_button(
+                "⬇️ Guardar archivo",
+                data=contenido,
+                file_name=nombre,
+                use_container_width=True,
+            )
+
+    else:
+        # Rango mayor a 1 mes: el servidor solo acepta 1 mes por request,
+        # así que se descarga tramo por tramo EN PARALELO y se consolida
+        # todo en un solo archivo.
+        st.info(
+            f"El rango pedido abarca {len(tramos)} meses. El portal COES solo "
+            f"permite descargar 1 mes a la vez, así que se descargarán en "
+            f"paralelo ({p['max_workers']} a la vez) y se consolidará todo "
+            f"en un solo archivo."
         )
 
-    return descarga.content
+        def _descargar_y_leer(ini, fin):
+            rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+            contenido, nombre, error = _descargar_tramo_cacheado(
+                fecha_inicial=ini.strftime("%d/%m/%Y"),
+                fecha_final=fin.strftime("%d/%m/%Y"),
+                empresas=p["empresas_val"],
+                tipos_generacion=p["tipo_gen_val"],
+                central=p["central_val"],
+                parametros=p["parametros_val"],
+                tipo=p["formato_val"],
+            )
+            if error:
+                raise RuntimeError(error)
 
+            if p["formato_val"] == "3":  # CSV
+                df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
+            else:  # Excel Horizontal o Vertical
+                df = pd.read_excel(io.BytesIO(contenido))
+            df.insert(0, "Tramo_Consultado", rango_str)
+            return df
 
-# =========================================================================
-# DETECCIÓN AUTOMÁTICA DE COLUMNAS EN EL EXCEL DESCARGADO
-# =========================================================================
-def detectar_columna(df: pd.DataFrame, keywords):
-    """Busca la primera columna cuyo nombre contenga TODAS las keywords dadas (case-insensitive)."""
-    for col in df.columns:
-        nombre = str(col).upper()
-        if all(kw.upper() in nombre for kw in keywords):
-            return col
-    return None
+        progreso = st.progress(0.0)
+        estado = st.empty()
+        t0 = time.time()
 
+        dataframes = []
+        errores = []  # (rango_str, mensaje)
 
-# =========================================================================
-# UI - FILTROS
-# =========================================================================
-with st.sidebar:
-    st.header("📅 Rango de fechas (obligatorio)")
-    hoy = date.today()
-    fecha_desde = st.date_input("Fecha desde", value=hoy - timedelta(days=30), format="DD/MM/YYYY")
-    fecha_hasta = st.date_input("Fecha hasta", value=hoy, format="DD/MM/YYYY")
+        with ThreadPoolExecutor(max_workers=p["max_workers"]) as executor:
+            futures = {
+                executor.submit(_descargar_y_leer, ini, fin): (ini, fin)
+                for ini, fin in tramos
+            }
 
-    st.header("⚙️ Estado del Mantenimiento")
-    mantenimiento_sel = st.selectbox(
-        "Mantenimiento",
-        options=list(MANTENIMIENTO_ESTADOS.keys()),
-        index=0,
-        help="Confirmado: EJECUTADOS. Los otros 3 estados se asumen por orden del formulario web.",
-    )
+            done = 0
+            for future in as_completed(futures):
+                ini, fin = futures[future]
+                rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+                try:
+                    dataframes.append(future.result())
+                except Exception as e:
+                    errores.append((rango_str, str(e)))
+                done += 1
+                progreso.progress(done / len(tramos))
+                estado.text(f"Procesados {done}/{len(tramos)} — último: {rango_str}")
 
-    st.header("🔩 Filtros (aplicados sobre el archivo descargado)")
-    tipo_equipo_sel = st.multiselect(
-        "Tipo de Equipo", options=TIPOS_EQUIPO_LABELS, default=GENERADORES_DEFAULT
-    )
-    tipo_mantto_sel = st.multiselect(
-        "Tipo de Mantenimiento", options=TIPOS_MANTTO_LABELS, default=[]
-    )
-    interrupcion_sel = st.selectbox("Con Interrupción", options=INTERRUPCION_OPCIONES, index=0)
-    tipo_empresa_sel = st.multiselect(
-        "Tipo de Empresa", options=TIPOS_EMPRESA_LABELS, default=[]
-    )
-    empresa_busqueda = st.text_input(
-        "Empresa (buscar texto parcial, opcional)",
-        help="La lista de empresas en COES tiene miles de entradas; busca por texto en vez de seleccionar de una lista.",
-    )
+        elapsed = time.time() - t0
+        estado.empty()
+        progreso.empty()
+        st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), {p['max_workers']} en paralelo)")
+
+        if errores:
+            with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron", expanded=True):
+                for rango_str, msg in errores:
+                    st.write(f"- **{rango_str}**: {msg}")
+
+        if dataframes:
+            df_final = pd.concat(dataframes, ignore_index=True)
+
+            st.success(
+                f"Listo — {len(dataframes)} de {len(tramos)} tramos consolidados "
+                f"({len(df_final):,} filas en total)."
+            )
+            st.dataframe(df_final.head(300), use_container_width=True)
+
+            nombre_base = (
+                f"MedidoresGeneracion_{p['fecha_inicial'].strftime('%Y%m%d')}_"
+                f"{p['fecha_final'].strftime('%Y%m%d')}_consolidado"
+            )
+
+            buf_xlsx = io.BytesIO()
+            with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
+                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+            st.download_button(
+                "⬇️ Descargar Excel consolidado",
+                data=buf_xlsx.getvalue(),
+                file_name=f"{nombre_base}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            buf_csv = df_final.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Descargar CSV consolidado",
+                data=buf_csv,
+                file_name=f"{nombre_base}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.error("No se pudo descargar ningún tramo.")
 
     st.divider()
-    buscar = st.button("🚀 Descargar y filtrar", type="primary", use_container_width=True)
-
-
-# =========================================================================
-# EJECUCIÓN
-# =========================================================================
-# --- Persistimos los parámetros de la última búsqueda en session_state.
-# Esto es clave: al presionar un botón de descarga, Streamlit vuelve a ejecutar
-# todo el script y el botón "buscar" deja de estar presionado (vuelve a False).
-# Si el bloque de resultados dependiera solo de `buscar`, desaparecería justo
-# antes de que el navegador complete la descarga. Con session_state, el bloque
-# se sigue mostrando (y descargando_reporte_mantenimientos usa caché, así que
-# no se vuelve a golpear el servidor de COES en cada rerun).
-if buscar:
-    if fecha_desde > fecha_hasta:
-        st.error("La fecha 'desde' no puede ser posterior a la fecha 'hasta'.")
-        st.stop()
-    st.session_state["coes_fetch_params"] = (
-        fecha_desde.strftime("%d/%m/%Y"),
-        fecha_hasta.strftime("%d/%m/%Y"),
-        MANTENIMIENTO_ESTADOS[mantenimiento_sel],
-        mantenimiento_sel,
-    )
-
-if "coes_fetch_params" in st.session_state:
-    fi, ff, code, mantenimiento_label = st.session_state["coes_fetch_params"]
-
-    with st.spinner(f"Descargando reporte de COES ({fi} a {ff}, {mantenimiento_label})..."):
-        try:
-            raw_bytes = descargar_reporte_mantenimientos(fi, ff, code)
-        except Exception as e:
-            st.error(f"❌ Error al descargar el reporte: {e}")
-            st.stop()
-
-    try:
-        df = pd.read_excel(io.BytesIO(raw_bytes))
-    except Exception as e:
-        st.error(
-            f"❌ El archivo descargado no se pudo leer como Excel ({e}). "
-            f"Puede que COES haya devuelto una página de error en vez del reporte."
-        )
-        st.stop()
-
-    df = df.dropna(how="all").reset_index(drop=True)
-    st.success(f"✅ Reporte descargado: {len(df):,} filas, {len(df.columns)} columnas.")
-
-    with st.expander("👀 Ver columnas originales del reporte (para verificar auto-detección)"):
-        st.write(list(df.columns))
-
-    # --- Auto-detección de columnas relevantes ---
-    col_equipo = detectar_columna(df, ["TIPO", "EQUIPO"])
-    col_mantto = detectar_columna(df, ["TIPO", "MANTENIMIENTO"]) or detectar_columna(df, ["TIPO", "MANTTO"])
-    col_interrup = detectar_columna(df, ["INTERRUP"])
-    col_tipo_empresa = detectar_columna(df, ["TIPO", "EMPRESA"])
-    col_empresa = detectar_columna(df, ["EMPRESA"])
-    # si "TIPO EMPRESA" y "EMPRESA" apuntaron a la misma columna, buscar otra para empresa
-    if col_empresa == col_tipo_empresa:
-        candidatos = [c for c in df.columns if "EMPRESA" in str(c).upper() and c != col_tipo_empresa]
-        col_empresa = candidatos[0] if candidatos else col_empresa
-
-    st.subheader("🔎 Verificación de columnas detectadas")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        col_equipo = st.selectbox("Col. Tipo de Equipo", options=[None] + list(df.columns),
-                                   index=(list(df.columns).index(col_equipo) + 1) if col_equipo in df.columns else 0)
-    with c2:
-        col_mantto = st.selectbox("Col. Tipo de Mantenimiento", options=[None] + list(df.columns),
-                                   index=(list(df.columns).index(col_mantto) + 1) if col_mantto in df.columns else 0)
-    with c3:
-        col_interrup = st.selectbox("Col. Con Interrupción", options=[None] + list(df.columns),
-                                     index=(list(df.columns).index(col_interrup) + 1) if col_interrup in df.columns else 0)
-    with c4:
-        col_tipo_empresa = st.selectbox("Col. Tipo de Empresa", options=[None] + list(df.columns),
-                                         index=(list(df.columns).index(col_tipo_empresa) + 1) if col_tipo_empresa in df.columns else 0)
-    with c5:
-        col_empresa = st.selectbox("Col. Empresa", options=[None] + list(df.columns),
-                                    index=(list(df.columns).index(col_empresa) + 1) if col_empresa in df.columns else 0)
-
-    # --- Aplicar filtros ---
-    df_filtrado = df.copy()
-
-    if tipo_equipo_sel and col_equipo:
-        df_filtrado = df_filtrado[
-            df_filtrado[col_equipo].astype(str).str.upper().str.strip().isin([t.upper() for t in tipo_equipo_sel])
-        ]
-
-    if tipo_mantto_sel and col_mantto:
-        df_filtrado = df_filtrado[
-            df_filtrado[col_mantto].astype(str).str.upper().str.strip().isin([t.upper() for t in tipo_mantto_sel])
-        ]
-
-    if interrupcion_sel != "--TODOS--" and col_interrup:
-        df_filtrado = df_filtrado[
-            df_filtrado[col_interrup].astype(str).str.upper().str.strip() == interrupcion_sel.upper()
-        ]
-
-    if tipo_empresa_sel and col_tipo_empresa:
-        df_filtrado = df_filtrado[
-            df_filtrado[col_tipo_empresa].astype(str).str.upper().str.strip().isin([t.upper() for t in tipo_empresa_sel])
-        ]
-
-    if empresa_busqueda.strip() and col_empresa:
-        df_filtrado = df_filtrado[
-            df_filtrado[col_empresa].astype(str).str.upper().str.contains(empresa_busqueda.strip().upper(), na=False)
-        ]
-
-    df_filtrado = df_filtrado.reset_index(drop=True)
-
-    st.subheader(f"📋 Resultado filtrado: {len(df_filtrado):,} de {len(df):,} filas")
-    st.dataframe(df_filtrado, use_container_width=True)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        buf_xlsx = io.BytesIO()
-        df_filtrado.to_excel(buf_xlsx, index=False, engine="openpyxl")
-        st.download_button(
-            "⬇️ Descargar filtrado (.xlsx)",
-            data=buf_xlsx.getvalue(),
-            file_name="coes_mantenimientos_filtrado.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    with col_b:
-        buf_csv = df_filtrado.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Descargar filtrado (.csv)",
-            data=buf_csv,
-            file_name="coes_mantenimientos_filtrado.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with st.expander("📦 Descargar también el reporte SIN filtrar (original de COES)"):
-        st.download_button(
-            "⬇️ Descargar original (.xlsx)",
-            data=raw_bytes,
-            file_name="coes_mantenimientos_original.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-else:
-    st.info("Configura los filtros en el panel izquierdo y presiona **Descargar y filtrar**.")
-
-if "coes_fetch_params" in st.session_state:
-    if st.sidebar.button("🗑️ Limpiar resultado / nueva búsqueda"):
-        del st.session_state["coes_fetch_params"]
+    if st.button("🗑️ Limpiar resultado / nueva búsqueda"):
+        del st.session_state["medidores_params"]
         st.rerun()
+else:
+    st.info("Configura los filtros arriba y presiona **📥 Descargar**.")
