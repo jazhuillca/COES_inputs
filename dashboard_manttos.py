@@ -180,6 +180,25 @@ def detectar_columna(df: pd.DataFrame, keywords):
     return None
 
 
+def detectar_fila_encabezado(raw_bytes: bytes, max_filas_prueba: int = 10) -> int:
+    """El reporte de COES trae unas filas de metadata (título, fecha inicial,
+    fecha final) antes de la fila real de encabezados. La cantidad de esas
+    filas puede variar según el estado del reporte (EJECUTADOS, PROGRAMADO
+    DIARIO/SEMANAL/MENSUAL), así que en vez de asumir siempre "fila 4"
+    buscamos la fila que más palabras clave de encabezado contiene.
+    Devuelve el índice de fila (0-indexado) para usar como header= en
+    pd.read_excel."""
+    vista = pd.read_excel(io.BytesIO(raw_bytes), header=None, nrows=max_filas_prueba)
+    palabras_clave = ("MANTENIMIENTO", "EMPRESA", "EQUIPO", "INICIO", "FIN", "UBICACION", "UBICACIÓN")
+    mejor_fila, mejor_score = 0, -1
+    for i in range(len(vista)):
+        valores = [str(v).upper().strip() for v in vista.iloc[i] if pd.notna(v)]
+        score = sum(1 for v in valores if any(k in v for k in palabras_clave))
+        if score > mejor_score:
+            mejor_score, mejor_fila = score, i
+    return mejor_fila
+
+
 # =========================================================================
 # UI - FILTROS
 # =========================================================================
@@ -255,15 +274,15 @@ if "coes_fetch_params" in st.session_state:
             st.stop()
 
     try:
-        # El reporte de COES trae 3 filas de encabezado/metadata arriba (título,
-        # fecha inicial, fecha final) y una columna A vacía antes de los datos
-        # reales. Los nombres de columna verdaderos (MANTENIMIENTO, TIPO EMPRESA,
-        # EMPRESA, UBICACIÓN, TIPO EQUIPO, EQUIPO, INICIO, ...) están en la fila 4
-        # del Excel, es decir header=3 en pandas (0-indexado), y arrancan en la
-        # columna B. Por eso: header=3 y luego se descarta la primera columna
-        # (queda como "Unnamed: 0" y está siempre vacía).
-        df = pd.read_excel(io.BytesIO(raw_bytes), header=3)
-        if len(df.columns) > 0 and str(df.columns[0]).startswith("Unnamed"):
+        # El reporte de COES trae filas de encabezado/metadata arriba (título,
+        # fecha inicial, fecha final) y columnas vacías (típicamente la A) antes
+        # de los datos reales. La cantidad de filas de metadata puede variar
+        # según el estado del reporte, así que se detecta dinámicamente en vez
+        # de asumir siempre "fila 4".
+        fila_header = detectar_fila_encabezado(raw_bytes)
+        df = pd.read_excel(io.BytesIO(raw_bytes), header=fila_header)
+        # Descartar columnas líder vacías (p.ej. columna A -> "Unnamed: 0")
+        while len(df.columns) > 0 and str(df.columns[0]).startswith("Unnamed") and df[df.columns[0]].isna().all():
             df = df.drop(columns=df.columns[0])
     except Exception as e:
         st.error(
