@@ -180,6 +180,71 @@ def detectar_columna(df: pd.DataFrame, keywords):
     return None
 
 
+def _generar_rangos_anuales(fecha_desde: date, fecha_hasta: date):
+    """Divide un rango de fechas en sub-rangos de máximo 1 año calendario cada uno.
+
+    Se comprobó que el portal de COES trunca/limita silenciosamente los reportes
+    que abarcan un rango muy amplio (p.ej. pedir 01/01/2024 a 31/07/2026 solo
+    devuelve datos de 2026, sin avisar del recorte). Pidiendo año por año y
+    combinando los resultados en pandas se evita ese límite del servidor.
+    Devuelve una lista de tuplas (desde, hasta) como objetos date.
+    """
+    rangos = []
+    inicio_actual = fecha_desde
+    while inicio_actual <= fecha_hasta:
+        fin_de_anio = date(inicio_actual.year, 12, 31)
+        fin_actual = min(fin_de_anio, fecha_hasta)
+        rangos.append((inicio_actual, fin_actual))
+        inicio_actual = fin_actual + timedelta(days=1)
+    return rangos
+
+
+def _parsear_excel_coes(raw_bytes: bytes) -> pd.DataFrame:
+    """Convierte los bytes crudos de un Excel de COES en un DataFrame limpio:
+    detecta la fila real de encabezados y descarta columnas líder vacías."""
+    fila_header = detectar_fila_encabezado(raw_bytes)
+    df_parte = pd.read_excel(io.BytesIO(raw_bytes), header=fila_header)
+    while (
+        len(df_parte.columns) > 0
+        and str(df_parte.columns[0]).startswith("Unnamed")
+        and df_parte[df_parte.columns[0]].isna().all()
+    ):
+        df_parte = df_parte.drop(columns=df_parte.columns[0])
+    return df_parte.dropna(how="all").reset_index(drop=True)
+
+
+def descargar_y_parsear_reporte(
+    fecha_desde: date, fecha_hasta: date, tipo_mantenimiento_code: str, progreso=None, estado_texto=None
+) -> tuple[pd.DataFrame, list]:
+    """Descarga el reporte completo pidiéndolo año por año (ver _generar_rangos_anuales)
+    y devuelve (df_combinado, errores). `errores` es una lista de strings describiendo
+    qué tramos anuales fallaron (si alguno falla, se sigue con los demás en vez de
+    abortar toda la descarga). `progreso`, si se pasa, es un st.progress() que se va
+    actualizando por cada sub-rango descargado; `estado_texto`, si se pasa, es un
+    st.empty() donde se va mostrando qué año se está pidiendo."""
+    rangos = _generar_rangos_anuales(fecha_desde, fecha_hasta)
+    partes = []
+    errores = []
+    for i, (desde_i, hasta_i) in enumerate(rangos, start=1):
+        if estado_texto is not None:
+            etiqueta_anio = desde_i.year if desde_i.year == hasta_i.year else f"{desde_i.year}-{hasta_i.year}"
+            estado_texto.text(f"Descargando tramo {i}/{len(rangos)} ({etiqueta_anio})...")
+        try:
+            raw_bytes = descargar_reporte_mantenimientos(
+                desde_i.strftime("%d/%m/%Y"), hasta_i.strftime("%d/%m/%Y"), tipo_mantenimiento_code
+            )
+            partes.append(_parsear_excel_coes(raw_bytes))
+        except Exception as e:
+            errores.append(f"{desde_i.strftime('%d/%m/%Y')} - {hasta_i.strftime('%d/%m/%Y')}: {e}")
+        if progreso is not None:
+            progreso.progress(i / len(rangos))
+
+    if not partes:
+        return pd.DataFrame(), errores
+    df = pd.concat(partes, ignore_index=True, sort=False)
+    return df.drop_duplicates().reset_index(drop=True), errores
+
+
 def detectar_fila_encabezado(raw_bytes: bytes, max_filas_prueba: int = 10) -> int:
     """El reporte de COES trae unas filas de metadata (título, fecha inicial,
     fecha final) antes de la fila real de encabezados. La cantidad de esas
@@ -257,41 +322,55 @@ if buscar:
         st.error("La fecha 'desde' no puede ser posterior a la fecha 'hasta'.")
         st.stop()
     st.session_state["coes_fetch_params"] = (
-        fecha_desde.strftime("%d/%m/%Y"),
-        fecha_hasta.strftime("%d/%m/%Y"),
+        fecha_desde,
+        fecha_hasta,
         MANTENIMIENTO_ESTADOS[mantenimiento_sel],
         mantenimiento_sel,
     )
 
 if "coes_fetch_params" in st.session_state:
-    fi, ff, code, mantenimiento_label = st.session_state["coes_fetch_params"]
+    fecha_desde_busq, fecha_hasta_busq, code, mantenimiento_label = st.session_state["coes_fetch_params"]
+    rangos_anuales = _generar_rangos_anuales(fecha_desde_busq, fecha_hasta_busq)
 
-    with st.spinner(f"Descargando reporte de COES ({fi} a {ff}, {mantenimiento_label})..."):
+    with st.spinner(
+        f"Descargando reporte de COES ({fecha_desde_busq.strftime('%d/%m/%Y')} a "
+        f"{fecha_hasta_busq.strftime('%d/%m/%Y')}, {mantenimiento_label})"
+        + (f" en {len(rangos_anuales)} tramos anuales..." if len(rangos_anuales) > 1 else "...")
+    ):
+        progreso = st.progress(0.0) if len(rangos_anuales) > 1 else None
+        estado_texto = st.empty() if len(rangos_anuales) > 1 else None
         try:
-            raw_bytes = descargar_reporte_mantenimientos(fi, ff, code)
+            # El rango se pide año por año y se combina, porque COES trunca
+            # silenciosamente los reportes que abarcan un rango de fechas muy
+            # amplio (ver _generar_rangos_anuales / descargar_y_parsear_reporte).
+            # Si algún año puntual falla (timeout, error del servidor, etc.), se
+            # sigue con los demás en vez de perder toda la descarga.
+            df, errores_descarga = descargar_y_parsear_reporte(
+                fecha_desde_busq, fecha_hasta_busq, code, progreso=progreso, estado_texto=estado_texto
+            )
         except Exception as e:
             st.error(f"❌ Error al descargar el reporte: {e}")
             st.stop()
+        finally:
+            if progreso is not None:
+                progreso.empty()
+            if estado_texto is not None:
+                estado_texto.empty()
 
-    try:
-        # El reporte de COES trae filas de encabezado/metadata arriba (título,
-        # fecha inicial, fecha final) y columnas vacías (típicamente la A) antes
-        # de los datos reales. La cantidad de filas de metadata puede variar
-        # según el estado del reporte, así que se detecta dinámicamente en vez
-        # de asumir siempre "fila 4".
-        fila_header = detectar_fila_encabezado(raw_bytes)
-        df = pd.read_excel(io.BytesIO(raw_bytes), header=fila_header)
-        # Descartar columnas líder vacías (p.ej. columna A -> "Unnamed: 0")
-        while len(df.columns) > 0 and str(df.columns[0]).startswith("Unnamed") and df[df.columns[0]].isna().all():
-            df = df.drop(columns=df.columns[0])
-    except Exception as e:
+    if df.empty:
         st.error(
-            f"❌ El archivo descargado no se pudo leer como Excel ({e}). "
-            f"Puede que COES haya devuelto una página de error en vez del reporte."
+            "❌ El archivo descargado no se pudo leer como Excel, o vino vacío. "
+            "Puede que COES haya devuelto una página de error en vez del reporte."
         )
         st.stop()
 
-    df = df.dropna(how="all").reset_index(drop=True)
+    if errores_descarga:
+        st.warning(
+            "⚠️ Algunos tramos anuales no se pudieron descargar, así que el reporte "
+            "está incompleto para esos años:\n\n"
+            + "\n".join(f"- {e}" for e in errores_descarga)
+        )
+
     st.success(f"✅ Reporte descargado: {len(df):,} filas, {len(df.columns)} columnas.")
 
     with st.expander("👀 Ver columnas originales del reporte (para verificar auto-detección)"):
