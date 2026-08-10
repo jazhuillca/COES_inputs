@@ -28,6 +28,7 @@ Ejecutar con:  streamlit run coes_mantenimientos_app.py
 """
 
 import io
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -124,10 +125,14 @@ def _session():
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def descargar_reporte_mantenimientos(fecha_inicial: str, fecha_final: str, tipo_mantenimiento_code: str) -> bytes:
+def descargar_reporte_mantenimientos(
+    fecha_inicial: str, fecha_final: str, tipo_mantenimiento_code: str, intento: int = 0
+) -> bytes:
     """
     fecha_inicial / fecha_final: strings dd/mm/yyyy.
     tipo_mantenimiento_code: código del estado (ver MANTENIMIENTO_ESTADOS).
+    intento: no se usa en la lógica, solo sirve para invalidar el caché de
+    Streamlit cuando se reintenta la misma descarga (ver descargar_y_parsear_reporte).
     Devuelve los bytes crudos del Excel descargado.
     """
     s = _session()
@@ -154,6 +159,13 @@ def descargar_reporte_mantenimientos(fecha_inicial: str, fecha_final: str, tipo_
 
     if str(resultado) != "1":
         raise RuntimeError(f"El servidor de COES no confirmó éxito al generar el reporte (respuesta: {resultado!r}).")
+
+    # El servidor genera el archivo de forma asíncrona: si se pide la
+    # descarga inmediatamente después, a veces todavía no terminó de generar
+    # el reporte nuevo y devuelve el último que sí tenía listo (de una
+    # consulta anterior, con otro rango de fechas). Esta pequeña espera le da
+    # tiempo a terminar antes de exportar.
+    time.sleep(1.5)
 
     descarga = s.get(f"{BASE}/mantenimiento/ExportarReporte", params={"tipo": 0}, timeout=90)
     descarga.raise_for_status()
@@ -213,6 +225,21 @@ def _parsear_excel_coes(raw_bytes: bytes) -> pd.DataFrame:
     return df_parte.dropna(how="all").reset_index(drop=True)
 
 
+def _validar_rango_chunk(df_parte: pd.DataFrame, desde_i: date, hasta_i: date) -> bool:
+    """Verifica que un chunk descargado realmente tenga fechas dentro del rango
+    pedido. Esto detecta el caso en que COES devuelve un reporte "viejo" (de una
+    consulta anterior) porque el archivo nuevo todavía no terminó de generarse
+    del lado del servidor. Si no se encuentra una columna de fecha reconocible,
+    se asume OK (no se puede verificar, mejor no bloquear falsos negativos)."""
+    col_fecha = detectar_columna(df_parte, ["INICIO"])
+    if col_fecha is None or df_parte.empty:
+        return True
+    fechas = pd.to_datetime(df_parte[col_fecha], errors="coerce", dayfirst=True).dropna()
+    if fechas.empty:
+        return True
+    return bool(((fechas.dt.date >= desde_i) & (fechas.dt.date <= hasta_i)).any())
+
+
 def descargar_y_parsear_reporte(
     fecha_desde: date, fecha_hasta: date, tipo_mantenimiento_code: str, progreso=None, estado_texto=None
 ) -> tuple[pd.DataFrame, list]:
@@ -221,21 +248,45 @@ def descargar_y_parsear_reporte(
     qué tramos anuales fallaron (si alguno falla, se sigue con los demás en vez de
     abortar toda la descarga). `progreso`, si se pasa, es un st.progress() que se va
     actualizando por cada sub-rango descargado; `estado_texto`, si se pasa, es un
-    st.empty() donde se va mostrando qué año se está pidiendo."""
+    st.empty() donde se va mostrando qué año se está pidiendo.
+
+    Cada tramo se valida contra el rango pedido (_validar_rango_chunk): si COES
+    devuelve un reporte que no corresponde (p.ej. quedó un reporte anterior sin
+    terminar de regenerarse del lado del servidor), se reintenta un par de veces
+    forzando una descarga nueva (evitando el caché local de Streamlit) antes de
+    darlo por fallido."""
     rangos = _generar_rangos_anuales(fecha_desde, fecha_hasta)
+    MAX_INTENTOS = 3
     partes = []
     errores = []
     for i, (desde_i, hasta_i) in enumerate(rangos, start=1):
-        if estado_texto is not None:
-            etiqueta_anio = desde_i.year if desde_i.year == hasta_i.year else f"{desde_i.year}-{hasta_i.year}"
-            estado_texto.text(f"Descargando tramo {i}/{len(rangos)} ({etiqueta_anio})...")
-        try:
-            raw_bytes = descargar_reporte_mantenimientos(
-                desde_i.strftime("%d/%m/%Y"), hasta_i.strftime("%d/%m/%Y"), tipo_mantenimiento_code
-            )
-            partes.append(_parsear_excel_coes(raw_bytes))
-        except Exception as e:
-            errores.append(f"{desde_i.strftime('%d/%m/%Y')} - {hasta_i.strftime('%d/%m/%Y')}: {e}")
+        etiqueta_anio = desde_i.year if desde_i.year == hasta_i.year else f"{desde_i.year}-{hasta_i.year}"
+        df_parte = None
+        ultimo_error = None
+        for intento in range(MAX_INTENTOS):
+            if estado_texto is not None:
+                sufijo = f" (reintento {intento}/{MAX_INTENTOS - 1})" if intento else ""
+                estado_texto.text(f"Descargando tramo {i}/{len(rangos)} ({etiqueta_anio}){sufijo}...")
+            try:
+                raw_bytes = descargar_reporte_mantenimientos(
+                    desde_i.strftime("%d/%m/%Y"), hasta_i.strftime("%d/%m/%Y"), tipo_mantenimiento_code,
+                    intento=intento,
+                )
+                candidato = _parsear_excel_coes(raw_bytes)
+                if _validar_rango_chunk(candidato, desde_i, hasta_i):
+                    df_parte = candidato
+                    break
+                ultimo_error = "COES devolvió un reporte que no corresponde a este rango (posible dato desactualizado)"
+                time.sleep(2 * (intento + 1))
+            except Exception as e:
+                ultimo_error = str(e)
+                time.sleep(2 * (intento + 1))
+
+        if df_parte is not None:
+            partes.append(df_parte)
+        else:
+            errores.append(f"{desde_i.strftime('%d/%m/%Y')} - {hasta_i.strftime('%d/%m/%Y')}: {ultimo_error}")
+
         if progreso is not None:
             progreso.progress(i / len(rangos))
 
@@ -243,6 +294,8 @@ def descargar_y_parsear_reporte(
         return pd.DataFrame(), errores
     df = pd.concat(partes, ignore_index=True, sort=False)
     return df.drop_duplicates().reset_index(drop=True), errores
+
+
 
 
 def detectar_fila_encabezado(raw_bytes: bytes, max_filas_prueba: int = 10) -> int:
