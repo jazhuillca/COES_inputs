@@ -589,10 +589,12 @@ if "coes_fetch_params" in st.session_state:
             use_container_width=True,
         )
 
-    with st.expander("📦 Descargar también el reporte SIN filtrar (original de COES)"):
+    with st.expander("📦 Descargar también el reporte SIN filtrar (original combinado de COES)"):
+        buf_original = io.BytesIO()
+        df.to_excel(buf_original, index=False, engine="openpyxl")
         st.download_button(
             "⬇️ Descargar original (.xlsx)",
-            data=raw_bytes,
+            data=buf_original.getvalue(),
             file_name="coes_mantenimientos_original.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
