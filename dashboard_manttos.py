@@ -255,7 +255,16 @@ if "coes_fetch_params" in st.session_state:
             st.stop()
 
     try:
-        df = pd.read_excel(io.BytesIO(raw_bytes))
+        # El reporte de COES trae 3 filas de encabezado/metadata arriba (título,
+        # fecha inicial, fecha final) y una columna A vacía antes de los datos
+        # reales. Los nombres de columna verdaderos (MANTENIMIENTO, TIPO EMPRESA,
+        # EMPRESA, UBICACIÓN, TIPO EQUIPO, EQUIPO, INICIO, ...) están en la fila 4
+        # del Excel, es decir header=3 en pandas (0-indexado), y arrancan en la
+        # columna B. Por eso: header=3 y luego se descarta la primera columna
+        # (queda como "Unnamed: 0" y está siempre vacía).
+        df = pd.read_excel(io.BytesIO(raw_bytes), header=3)
+        if len(df.columns) > 0 and str(df.columns[0]).startswith("Unnamed"):
+            df = df.drop(columns=df.columns[0])
     except Exception as e:
         st.error(
             f"❌ El archivo descargado no se pudo leer como Excel ({e}). "
