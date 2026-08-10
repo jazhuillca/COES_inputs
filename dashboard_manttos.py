@@ -491,10 +491,27 @@ if "coes_fetch_params" in st.session_state:
                 return ["background-color: #ffe1e1"] * len(row)
             return [""] * len(row)
 
-        st.dataframe(
-            df_filtrado.style.apply(resaltar_mayor_3, axis=1),
-            use_container_width=True,
-        )
+        # pandas.Styler tiene un límite duro de celdas que puede renderizar
+        # (pd.options.styler.render.max_elements, ~262,144 por defecto). Con
+        # varios años de datos combinados, el resultado filtrado puede superar
+        # ese límite fácilmente y styler.apply() revienta con una excepción.
+        # Por eso solo se usa el resaltado de color cuando el tamaño es
+        # razonable; si no, se muestra la tabla sin colorear (los datos siguen
+        # completos, solo se pierde el resaltado visual).
+        LIMITE_CELDAS_STYLER = 250_000
+        if df_filtrado.size <= LIMITE_CELDAS_STYLER:
+            st.dataframe(
+                df_filtrado.style.apply(resaltar_mayor_3, axis=1),
+                use_container_width=True,
+            )
+        else:
+            st.caption(
+                f"ℹ️ El resultado tiene {df_filtrado.size:,} celdas, por lo que se omite el "
+                f"resaltado de color (límite: {LIMITE_CELDAS_STYLER:,}) para que la tabla no falle. "
+                "Los datos están completos igual; puedes filtrar más para ver el resaltado, "
+                "o descargar el Excel/CSV más abajo."
+            )
+            st.dataframe(df_filtrado, use_container_width=True)
     else:
         st.dataframe(df_filtrado, use_container_width=True)
 
